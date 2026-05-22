@@ -600,42 +600,54 @@ test('agent-mode: python code that produces no file → tool_done with no_file=t
   assert.strictEqual(finalEv.message.artifacts[0].filename, 'final.txt');
 });
 
-test('agent-mode: empty `code` argument → BAD_ARGUMENTS tool_error', async (t) => {
+test('agent-mode: empty `code` argument → tool_done with no_file=true (NOT a tool_error)', async (t) => {
+  // Production observation: under tool_choice='required' DeepSeek
+  // sometimes emits a tool_call with `code: ""` (registers intent
+  // without committing to specific code, expecting to refine on the
+  // next call). We treat that as a benign recon-style soft miss so
+  // the user doesn't see a scary "技能运行失败" chip while the loop
+  // self-corrects. The tool message handed back to the model carries
+  // a hint to send real code next time.
   const tmp = freshEnv();
   const fastify = await bootServer(t, tmp);
   const token = await loginAs(fastify, 'rootadmin', 'rootpass');
   const skill = await uploadAgentOnlyAsAdmin(fastify, token);
 
-  installMockFetch(t, [
+  const captured = [];
+  installMockFetch(
+    t,
     [
-      dataChunk({
-        choices: [
-          {
-            delta: {
-              tool_calls: [
-                {
-                  index: 0,
-                  id: 'empty',
-                  type: 'function',
-                  function: {
-                    name: 'run_python_code',
-                    arguments: JSON.stringify({ code: '   ' }),
+      [
+        dataChunk({
+          choices: [
+            {
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: 'empty',
+                    type: 'function',
+                    function: {
+                      name: 'run_python_code',
+                      arguments: JSON.stringify({ code: '   ' }),
+                    },
                   },
-                },
-              ],
+                ],
+              },
             },
-          },
-        ],
-      }),
-      dataChunk({ choices: [{ delta: {}, finish_reason: 'tool_calls' }] }),
-      doneChunk(),
+          ],
+        }),
+        dataChunk({ choices: [{ delta: {}, finish_reason: 'tool_calls' }] }),
+        doneChunk(),
+      ],
+      [
+        dataChunk({ choices: [{ delta: { content: 'sending real code next' } }] }),
+        dataChunk({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+        doneChunk(),
+      ],
     ],
-    [
-      dataChunk({ choices: [{ delta: { content: 'oops, empty code' } }] }),
-      dataChunk({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
-      doneChunk(),
-    ],
-  ]);
+    captured,
+  );
 
   const conv = await fastify.inject({
     method: 'POST',
@@ -653,9 +665,21 @@ test('agent-mode: empty `code` argument → BAD_ARGUMENTS tool_error', async (t)
   assert.strictEqual(res.statusCode, 200);
 
   const events = parseClientSse(res.body);
-  const toolError = events.find((e) => e.tool_error);
-  assert.ok(toolError);
-  assert.strictEqual(toolError.tool_error.code, 'BAD_ARGUMENTS');
+  // No tool_error event must be sent (was the source of "技能运行失败" chip)
+  assert.strictEqual(
+    events.some((e) => e.tool_error),
+    false,
+    'empty code must NOT produce a tool_error event',
+  );
+  // tool_done with no_file=true must appear instead
+  const toolDone = events.find((e) => e.tool_done && e.tool_done.no_file === true);
+  assert.ok(toolDone, 'expected tool_done {no_file:true} for empty-code call');
+
+  // The model's tool message in iter 1 history must contain the no_file
+  // hint so the model knows to send real code next time
+  const iter1ToolMsg = captured[1].messages.find((m) => m.role === 'tool');
+  assert.ok(iter1ToolMsg);
+  assert.match(iter1ToolMsg.content, /no_file|empty/);
 });
 
 test('agent-mode: model wrongly calls run_skill → UNKNOWN_TOOL', async (t) => {

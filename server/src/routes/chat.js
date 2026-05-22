@@ -603,51 +603,79 @@ async function chatRoutes(app) {
                         ? parsedArgs.stdin
                         : '';
                     if (!code.trim()) {
-                      throw Object.assign(new Error('`code` parameter is required'), {
-                        code: 'BAD_ARGUMENTS',
+                      // The model sent a tool_call with empty `code`. Common
+                      // under tool_choice='required' on a fresh turn — the
+                      // model registers intent to call the tool but hasn't
+                      // committed to specific code yet. Treat as a benign
+                      // recon-style miss rather than a hard failure so we
+                      // don't surface a scary "tool_error" chip to the user
+                      // while the loop iterates and the model self-corrects.
+                      toolResultPayload = {
+                        ok: true,
+                        no_file: true,
+                        message:
+                          'The `code` argument was empty. Send a real Python ' +
+                          '3 snippet that writes the deliverable under ' +
+                          'OPENSKILL_OUTPUT_DIR on the next call.',
+                      };
+                      send({
+                        tool_done: {
+                          filename: null,
+                          content_type: null,
+                          size_bytes: 0,
+                          duration_ms: 0,
+                          no_file: true,
+                        },
+                      });
+                      // Skip runPythonCode and the success path for this tc
+                      runResult = null;
+                    } else {
+                      runResult = await runPythonCode({
+                        zipBuffer,
+                        manifest,
+                        code,
+                        stdin,
+                        limits,
                       });
                     }
-                    runResult = await runPythonCode({
-                      zipBuffer,
-                      manifest,
-                      code,
-                      stdin,
-                      limits,
-                    });
                   }
 
                   // Buffer artifact in memory; we'll persist after we know
                   // the assistant message_id at the end of the turn.
-                  pendingArtifacts.push({
-                    filename: runResult.filename,
-                    contentType: runResult.contentType,
-                    data: runResult.data,
-                    skillSlug: skillRow.slug,
-                  });
+                  // (Skip when runResult is null — empty-code path already
+                  // handled the tool_done + toolResultPayload above.)
+                  if (runResult) {
+                    pendingArtifacts.push({
+                      filename: runResult.filename,
+                      contentType: runResult.contentType,
+                      data: runResult.data,
+                      skillSlug: skillRow.slug,
+                    });
 
-                  toolResultPayload = {
-                    ok: true,
-                    filename: runResult.filename,
-                    content_type: runResult.contentType,
-                    size_bytes: runResult.data.length,
-                    duration_ms: runResult.durationMs,
-                    // Pipe stdout/stderr (truncated) back so the model can
-                    // confirm what its code observed during this turn —
-                    // critical for chained calls (recon → real run).
-                    stdout: truncateForModel(runResult.stdout),
-                    stderr: truncateForModel(runResult.stderr),
-                    note:
-                      'The file has been attached to your reply. The user will see ' +
-                      'a download button automatically — do not invent links.',
-                  };
-                  send({
-                    tool_done: {
+                    toolResultPayload = {
+                      ok: true,
                       filename: runResult.filename,
                       content_type: runResult.contentType,
                       size_bytes: runResult.data.length,
                       duration_ms: runResult.durationMs,
-                    },
-                  });
+                      // Pipe stdout/stderr (truncated) back so the model can
+                      // confirm what its code observed during this turn —
+                      // critical for chained calls (recon → real run).
+                      stdout: truncateForModel(runResult.stdout),
+                      stderr: truncateForModel(runResult.stderr),
+                      note:
+                        'The file has been attached to your reply. The user will see ' +
+                        'a download button automatically — do not invent links.',
+                    };
+                    send({
+                      tool_done: {
+                        filename: runResult.filename,
+                        content_type: runResult.contentType,
+                        size_bytes: runResult.data.length,
+                        duration_ms: runResult.durationMs,
+                      },
+                    });
+                  }
                 } catch (err) {
                   // EMPTY_OUTPUT is special: the script ran successfully, it
                   // just didn't produce a file. Common, legitimate case is
