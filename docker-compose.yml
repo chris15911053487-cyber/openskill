@@ -1,0 +1,22 @@
+# Development compose — runs the production-style image with hot data folder.
+# For day-to-day development you can also just run `npm run dev` on the host
+# (frontend on :5173 with proxy, server on :3000).
+
+services:
+  openskill:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: openskill:dev
+    container_name: openskill-dev
+    restart: unless-stopped
+    ports:
+      - "${HOST_PORT:-8088}:3000"
+    environment:
+      NODE_ENV: production
+      DB_PATH: /app/data/openskill.db
+      STORAGE_DIR: /app/data/storage
+      JWT_SECRET: ${JWT_SECRET:-dev-only-insecure-secret}
+      ADMIN_INITIAL_PASSWORD: ${ADMIN_INITIAL_PASSWORD:-admin123}
+    volumes:
+      - ./data:/app/data

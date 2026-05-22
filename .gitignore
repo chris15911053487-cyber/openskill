@@ -1,0 +1,34 @@
+# dependencies
+node_modules/
+
+# build outputs
+dist/
+build/
+frontend/dist/
+server/public/
+
+# env files (real secrets)
+.env
+.env.*
+!.env.example
+server/.env
+!server/.env.example
+
+# persistent data — NEVER commit
+data/
+
+# logs
+*.log
+npm-debug.log*
+
+# os
+.DS_Store
+Thumbs.db
+
+# editor
+.vscode/
+.idea/
+*.swp
+
+# coverage
+coverage/

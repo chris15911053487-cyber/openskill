@@ -1,0 +1,47 @@
+# Production deployment compose.
+#
+# Persistence: ./data on the host is bind-mounted to /app/data inside the
+# container. The SQLite database (openskill.db) and all uploaded skill ZIPs
+# (storage/skills/*.zip) live there. As long as you do not delete this
+# directory, rebuilding or pulling new images will NOT lose data.
+#
+# Usage:
+#   1. cp .env.example .env  # edit JWT_SECRET, ADMIN_INITIAL_PASSWORD, HOST_PORT
+#   2. docker compose -f docker-compose.deploy.yml up -d --build
+#   3. open http://<host>:8088 (or the HOST_PORT you set)
+
+services:
+  openskill:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: openskill:latest
+    container_name: openskill
+    restart: unless-stopped
+    ports:
+      - "${HOST_PORT:-8088}:3000"
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      HOST: 0.0.0.0
+      DB_PATH: /app/data/openskill.db
+      STORAGE_DIR: /app/data/storage
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-7d}
+      ADMIN_INITIAL_USERNAME: ${ADMIN_INITIAL_USERNAME:-admin}
+      ADMIN_INITIAL_EMAIL: ${ADMIN_INITIAL_EMAIL:-admin@example.com}
+      ADMIN_INITIAL_PASSWORD: ${ADMIN_INITIAL_PASSWORD}
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-20}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_API_URL: ${LLM_API_URL:-https://api.openai.com/v1/chat/completions}
+      LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
+    volumes:
+      # CRITICAL: this bind mount is what makes the data survive `docker compose
+      # build` and `docker compose pull`. Do not remove it.
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

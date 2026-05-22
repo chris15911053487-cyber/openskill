@@ -1,0 +1,24 @@
+{
+  "name": "openskill-server",
+  "version": "0.1.0",
+  "private": true,
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "test": "node --test --test-reporter=spec test"
+  },
+  "dependencies": {
+    "@fastify/cors": "^10.0.1",
+    "@fastify/jwt": "^10.1.0",
+    "@fastify/multipart": "^9.0.1",
+    "@fastify/static": "^9.1.3",
+    "adm-zip": "^0.5.16",
+    "bcrypt": "^6.0.0",
+    "better-sqlite3": "^11.3.0",
+    "dotenv": "^16.4.5",
+    "fastify": "^5.1.0",
+    "js-yaml": "^4.1.0",
+    "zod": "^3.23.8"
+  }
+}
