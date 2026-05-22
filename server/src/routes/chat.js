@@ -702,14 +702,34 @@ async function chatRoutes(app) {
       }
 
       // Persist the assistant's final reply + link artifacts to it.
+      //
+      // Fallback: if the LLM returned absolutely nothing (no text, no tool
+      // calls, no artifacts) — typically a transient DeepSeek issue or
+      // context-window edge case — persist a visible placeholder so the
+      // user doesn't see a blank turn and silently lose their question.
       let assistantId = null;
       const persistedArtifacts = [];
-      if (finalAssistantText || pendingArtifacts.length > 0) {
+      let contentToPersist = finalAssistantText;
+      if (!finalAssistantText && pendingArtifacts.length === 0) {
+        req.log.warn(
+          {
+            convId: conv.id,
+            skillId: conv.skill_id,
+            skillMode,
+            toolsExposed: tools.length,
+          },
+          'chat turn produced no text and no artifacts — persisting placeholder',
+        );
+        contentToPersist =
+          'The model did not return any content for this turn. ' +
+          'This is usually a transient upstream issue; please try sending the message again.';
+      }
+      if (contentToPersist || pendingArtifacts.length > 0) {
         const result = db
           .prepare(
             'INSERT INTO messages (conversation_id, role, content) VALUES (?, ?, ?)',
           )
-          .run(conv.id, 'assistant', finalAssistantText || '');
+          .run(conv.id, 'assistant', contentToPersist || '');
         assistantId = result.lastInsertRowid;
 
         for (const art of pendingArtifacts) {
@@ -741,7 +761,7 @@ async function chatRoutes(app) {
       send({
         message: {
           id: assistantId,
-          content: finalAssistantText,
+          content: contentToPersist,
           artifacts: persistedArtifacts,
         },
       });
