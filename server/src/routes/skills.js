@@ -6,7 +6,24 @@ const path = require('path');
 const { slugify } = require('../utils/slug');
 const { validateSkillZip } = require('../skill-validator');
 const { saveSkillZip, deleteSkillZip, skillZipPath } = require('../storage');
-const { badRequest, conflict, notFound, forbidden } = require('../errors');
+const { runSkill, checkRunnable, DEFAULTS: RUNNER_DEFAULTS } = require('../skill-runner');
+const { badRequest, conflict, notFound, forbidden, HttpError } = require('../errors');
+
+// Map RunnerError codes -> HTTP status. Anything not listed defaults to 500.
+const RUNNER_STATUS = {
+  RUN_BUSY: 409,
+  ZIP_CORRUPT: 422,
+  ZIP_UNSAFE_PATH: 422,
+  INVALID_ENTRY: 422,
+  ENTRY_NOT_FOUND: 422,
+  UNSUPPORTED_RUNTIME: 422,
+  EMPTY_OUTPUT: 422,
+  SCRIPT_FAILED: 422,
+  INPUT_TOO_LARGE: 413,
+  OUTPUT_TOO_LARGE: 413,
+  TIMEOUT: 504,
+  NOT_RUNNABLE: 422,
+};
 
 const slugSchema = z
   .string()
@@ -365,6 +382,137 @@ async function skillsRoutes(fastify) {
         )
         .header('Content-Length', String(row.file_size));
       return reply.send(stream);
+    },
+  );
+
+  // ---------------------------------------------------------------------------
+  // POST /skills/:slug/run — execute the skill server-side and stream back
+  // the file(s) it produces.
+  //
+  // Body: { input: any }   — JSON serialisable; <= 1 MB
+  //
+  // Skill must contain `scripts/run.js` (or a custom entry declared in
+  // manifest.run.entry). Server pre-installs `docx` and `exceljs` for the
+  // skill to require(). On success, streams a single output file or a
+  // synthetic ZIP of multiple outputs. Any RunnerError is translated to
+  // a structured 4xx/5xx error.
+  //
+  // Concurrency: a process-wide lock; concurrent runs return 409 RUN_BUSY.
+  // ---------------------------------------------------------------------------
+  fastify.post(
+    '/skills/:slug/run',
+    {
+      onRequest: [fastify.authenticate],
+      // Cap JSON body to the runner's input limit (1 MB by default).
+      bodyLimit: RUNNER_DEFAULTS.maxInputBytes + 1024,
+    },
+    async (req, reply) => {
+      const row = db
+        .prepare(
+          `SELECT id, slug, status, author_user_id, file_path,
+                  manifest_json, file_tree_json
+           FROM skills WHERE slug = ?`,
+        )
+        .get(req.params.slug);
+      if (!row) throw notFound('SKILL_NOT_FOUND', 'Skill not found');
+
+      if (row.status !== 'published') {
+        if (req.user.role !== 'admin' && req.user.id !== row.author_user_id) {
+          throw forbidden('FORBIDDEN', 'This skill is not published');
+        }
+      }
+
+      // Parse cached metadata
+      const fileTree = row.file_tree_json ? JSON.parse(row.file_tree_json) : [];
+      const merged = row.manifest_json ? JSON.parse(row.manifest_json) : null;
+      const manifest = merged?.manifest || null;
+
+      // Cheap pre-check: is the skill runnable?
+      const reason = checkRunnable(fileTree, manifest);
+      if (reason) {
+        throw new HttpError(
+          422,
+          'NOT_RUNNABLE',
+          `Skill is not runnable: ${reason}`,
+        );
+      }
+
+      // Resolve & validate the ZIP path
+      const filePath = path.resolve(skillsDir, row.file_path);
+      const skillsDirAbs = path.resolve(skillsDir);
+      if (
+        !filePath.startsWith(skillsDirAbs + path.sep) &&
+        filePath !== skillsDirAbs
+      ) {
+        throw badRequest('INVALID_PATH', 'Refused to read a path outside skills storage');
+      }
+      if (!fs.existsSync(filePath)) {
+        throw notFound('SKILL_FILE_MISSING', 'Skill file is missing on disk');
+      }
+      const zipBuffer = fs.readFileSync(filePath);
+
+      // Body shape: { input?: any }
+      const body = req.body || {};
+      const input = 'input' in body ? body.input : {};
+
+      // Path to server's node_modules so the skill can `require('docx')` etc.
+      // __dirname here is .../server/src/routes; node_modules sits at
+      // .../server/node_modules.
+      const serverNodeModules = path.resolve(__dirname, '..', '..', 'node_modules');
+
+      // Determine timeout from manifest if present (capped inside runner)
+      const limits = {};
+      if (manifest?.run && Number.isFinite(manifest.run.timeout_ms)) {
+        limits.timeoutMs = manifest.run.timeout_ms;
+      }
+
+      let result;
+      try {
+        result = await runSkill({
+          zipBuffer,
+          manifest,
+          input,
+          extraNodePaths: [serverNodeModules],
+          limits,
+        });
+      } catch (err) {
+        if (err && err.code && RUNNER_STATUS[err.code]) {
+          req.log.warn(
+            { code: err.code, slug: row.slug, detail: err.detail },
+            'skill run failed',
+          );
+          throw new HttpError(
+            RUNNER_STATUS[err.code],
+            err.code,
+            err.message,
+            err.detail,
+          );
+        }
+        req.log.error({ err }, 'skill run failed unexpectedly');
+        throw err;
+      }
+
+      req.log.info(
+        {
+          slug: row.slug,
+          duration_ms: result.durationMs,
+          out_bytes: result.data.length,
+          out_filename: result.filename,
+        },
+        'skill run ok',
+      );
+
+      reply
+        .header('Content-Type', result.contentType)
+        .header(
+          'Content-Disposition',
+          `attachment; filename="${result.filename.replace(/"/g, '')}"`,
+        )
+        .header('Content-Length', String(result.data.length))
+        // Surface a couple of useful pieces of metadata for the frontend
+        .header('X-OpenSkill-Run-Duration-Ms', String(result.durationMs))
+        .header('X-OpenSkill-Run-Filename', encodeURIComponent(result.filename));
+      return reply.send(result.data);
     },
   );
 

@@ -5,16 +5,17 @@
 一个自托管的 **[Anthropic Agent Skills](https://docs.claude.com/en/api/agent-sdk/skills)** 管理平台。在一个 Web 应用里完成上传、审核、订阅、下载和在线预览，支持管理员/普通用户角色，数据通过 bind mount 持久化。
 
 ![Status](https://img.shields.io/badge/status-mvp%20complete-green)
-![Tests](https://img.shields.io/badge/tests-29%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-43%20passing-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
 ## 功能一览
 
 - 📚 **目录浏览** — 全文搜索、分类筛选、标签 chip 筛选，按最新/最多订阅/最多下载/名称排序
-- 🔍 **在线预览** — 详情页四个 Tab：Overview（安装命令）/ Preview（SKILL.md 实时渲染）/ Files（可折叠文件树）/ Frontmatter（结构化 JSON）
+- 🔍 **在线预览** — 详情页五个 Tab：Overview（安装命令）/ Preview（SKILL.md 实时渲染）/ Files（可折叠文件树）/ Frontmatter（结构化 JSON）/ Run（服务端执行 → 文件下载）
 - 📦 **严格上传校验** — 自动验证 ZIP 结构，提取 `SKILL.md` frontmatter（必含 `name` 和 `description`），可选解析 `manifest.json`，计算 SHA-256
 - 👨‍⚖️ **双轨审核流程** — 管理员上传立即发布；普通用户上传进入审核队列，管理员可通过/驳回（带理由）；驳回后作者可改后重传
 - ⭐ **订阅 + 下载** — 计数自动维护，含每用户历史
+- ▶️ **浏览器内运行** — 含 `scripts/run.js` 的技能可在详情页点 **Run** 由服务端执行，产出的 `.xlsx` / `.docx` / `.pdf` 等文件流回浏览器；服务端预装 `docx` 和 `exceljs`
 - 🛠️ **管理后台** — 审核队列、分类与标签 CRUD、用户列表、统计仪表板
 - 🐳 **一键 Docker 部署** — 数据持久化通过 bind mount，重建镜像不丢数据
 
@@ -26,7 +27,7 @@
 | 前端 | React 19 + Vite 8 + TypeScript + TailwindCSS + Zustand + TanStack Query |
 | 认证 | JWT（`@fastify/jwt`）+ bcrypt（rounds=12） |
 | Skill 格式 | [Anthropic Agent Skills](https://docs.claude.com/en/api/agent-sdk/skills)：根 `SKILL.md` + 可选 `scripts/` `references/` `assets/`，打包为 ZIP |
-| 测试 | `node:test`（Node.js 内建），29 个测试覆盖认证、校验、目录等 |
+| 测试 | `node:test`（Node.js 内建），43 个测试覆盖认证、校验、目录、服务端技能执行等 |
 
 ## 快速开始（Docker）
 
@@ -121,6 +122,63 @@ stateDiagram-v2
     Rejected --> [*]: 删除
 ```
 
+## 可运行技能（服务端执行）
+
+当 ZIP 包含 Node.js 入口脚本（默认 `scripts/run.js`），技能就变成 **可运行的**。详情页会出现第 5 个 **Run** Tab：用户在文本框里贴 JSON 输入，点 Run，服务端在隔离的临时目录里执行脚本，产出的文件作为下载流回浏览器。
+
+```
+my-skill/
+├── SKILL.md
+├── manifest.json        # 可选；用 `run` 字段配置执行行为
+└── scripts/
+    └── run.js           # 默认入口
+```
+
+`scripts/run.js` 的协议：
+
+| 输入                                | 输出                                  |
+|-------------------------------------|---------------------------------------|
+| `process.env.OPENSKILL_INPUT_FILE`  | `process.env.OPENSKILL_OUTPUT_DIR`    |
+| （同时通过 stdin 提供）              | 一个或多个文件（默认上限 50 MB）      |
+
+Runner 用白名单环境变量（`PATH`、`HOME`、`LANG`、`OPENSKILL_INPUT_FILE`、`OPENSKILL_OUTPUT_DIR`、`NODE_PATH`）spawn `node`，并通过 `NODE_PATH` **预装 `docx` + `exceljs`**，所以可运行技能可以直接 `require('docx')` 或 `require('exceljs')`，无需打包。其他依赖请把 `node_modules/` 一起塞进 ZIP。
+
+脚本正常退出后，runner：
+
+- `OPENSKILL_OUTPUT_DIR` 中 **0 个文件** → 422 `EMPTY_OUTPUT`
+- **1 个文件** → 流回浏览器，`Content-Type` 由扩展名推断
+- **N 个文件** → 自动打包成单个 `.zip` 流回
+
+`manifest.json` 中可选的 `run` 块用来覆盖默认值：
+
+```json
+{
+  "name": "xlsx-generator",
+  "version": "1.0.0",
+  "run": {
+    "entry": "scripts/run.js",
+    "runtime": "node",
+    "timeout_ms": 30000,
+    "input_example": { "sheetName": "Demo", "rows": [["a", "b"]] }
+  }
+}
+```
+
+`input_example` 会预填 Run Tab 的输入框。`timeout_ms` 在 `[1000, 300000]` 区间夹紧。目前只支持 `node` 运行时。
+
+仓库里 `examples/xlsx-generator/` 是一个完整可用的示例。打包：
+
+```bash
+node scripts/build-examples.js
+# → examples/dist/xlsx-generator.zip
+```
+
+通过 UI 上传这个 ZIP 然后点 **Run** 即可试用。
+
+> **并发**：进程级单 flight 锁。当一个运行进行中时，第二个 `/run` 请求直接返回 409 `RUN_BUSY`。这是为单用户/小团队部署设计的，多租户使用前请先加外部沙箱。
+
+> **安全提醒**：当前不做硬隔离（无 seccomp / cgroups / 网络策略），脚本以服务进程同样的 OS 用户运行。**只对你审核过的技能开放运行**。要让陌生人上传可运行技能，请先接 Firecracker / gVisor / Docker-in-Docker 等外部沙箱。
+
 ## 数据持久化（升级前必读）
 
 所有持久化状态都在宿主机的 `./data/` 目录，bind 挂载到容器的 `/app/data`：
@@ -188,7 +246,7 @@ docker compose -f docker-compose.deploy.yml up -d
 3. ☐ 用 `admin` 登录，创建分类 "Productivity" 和标签 "writing"
 4. ☐ 以 admin 身份在 Upload 页上传一个合法 skill ZIP → status `published`
 5. ☐ Catalog 显示该 skill；分类、标签筛选正确
-6. ☐ 点进详情 → 四个 Tab 都正常渲染（Overview / Preview / Files / Frontmatter）；复制安装命令
+6. ☐ 点进详情 → 四个内容 Tab 都正常渲染（Overview / Preview / Files / Frontmatter）；复制安装命令；如果该 skill 是可运行的，还会出现第 5 个 **Run** Tab
 7. ☐ 订阅（计数 +1）→ 退订 → 再订阅
 8. ☐ 点击 Download → 文件 SHA-256 与上传时一致
 9. ☐ 登出，以 `alice` 登录上传另一个 ZIP → status `pending`
@@ -212,6 +270,7 @@ POST   /skills                         # 上传（multipart：file, slug?, categ
 PUT    /skills/:slug                   # 重新上传（作者或管理员）
 DELETE /skills/:slug                   # 删除（作者或管理员）
 GET    /skills/:slug/download          # 下载 ZIP，计数 +1
+POST   /skills/:slug/run                # body: { input }；流回产出的文件
 POST   /skills/:slug/subscribe
 DELETE /skills/:slug/subscribe
 GET    /skills/:slug/subscription      # { subscribed: bool }
@@ -250,12 +309,15 @@ openskill/
 ├── README.md                   # 英文版
 ├── README.zh-CN.md             # 本文件
 ├── data/                       # ⚠️ 运行时状态（gitignored）
+├── examples/                   # 可运行示例技能（xlsx-generator 等）
+│   └── README.md               # runnable-skill 协议参考
 ├── scripts/
-│   └── backup.sh               # SQLite 在线备份 + storage 打包
+│   ├── backup.sh               # SQLite 在线备份 + storage 打包
+│   └── build-examples.js       # 把 examples/<skill>/ 打包到 examples/dist/<skill>.zip
 ├── server/                     # Fastify + better-sqlite3
-│   ├── src/                    # 入口、db、auth、validators、routes/*
+│   ├── src/                    # 入口、db、auth、validators、skill-runner、routes/*
 │   ├── sql/                    # 顺序编号的 SQL 迁移
-│   └── test/                   # node:test 测试套件（29 个）
+│   └── test/                   # node:test 测试套件（43 个）
 └── frontend/                   # React + Vite SPA
     └── src/
         ├── components/         # MainLayout、Toast、SkillMarkdown、FileTree

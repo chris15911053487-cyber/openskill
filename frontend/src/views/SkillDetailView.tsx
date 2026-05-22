@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   ArrowLeft,
@@ -17,8 +17,9 @@ import {
   Eye,
   Files,
   Info,
+  Play,
 } from 'lucide-react';
-import { api, ApiClientError, downloadFile } from '../utils/api';
+import { api, ApiClientError, downloadFile, postAndDownload } from '../utils/api';
 import { useStore, useT } from '../store';
 import type { TranslationKey } from '../i18n';
 import { SkillMarkdown } from '../components/SkillMarkdown';
@@ -37,7 +38,7 @@ interface PreviewResponse {
   file_tree: FileTreeEntry[];
 }
 
-type Tab = 'overview' | 'preview' | 'files' | 'manifest';
+type Tab = 'overview' | 'preview' | 'files' | 'manifest' | 'run';
 
 const STATUS_KEYS: Record<SkillDetail['status'], TranslationKey> = {
   published: 'skill.status.published',
@@ -83,7 +84,9 @@ export function SkillDetailView() {
   const previewQ = useQuery({
     queryKey: ['skill-preview', slug],
     queryFn: () => api<PreviewResponse>(`/skills/${slug}/preview`),
-    enabled: !!slug && tab !== 'overview',
+    // Load preview eagerly so we can determine whether the skill is runnable
+    // (and decide whether to show the Run tab) without waiting for a click.
+    enabled: !!slug,
   });
 
   if (!slug) {
@@ -140,12 +143,18 @@ export function SkillDetailView() {
               <TabButton active={tab === 'manifest'} onClick={() => setTab('manifest')} icon={<FileCode className="w-4 h-4" />}>
                 {t('skill.tab.manifest')}
               </TabButton>
+              {isSkillRunnable(previewQ.data) && (
+                <TabButton active={tab === 'run'} onClick={() => setTab('run')} icon={<Play className="w-4 h-4" />}>
+                  {t('skill.tab.run')}
+                </TabButton>
+              )}
             </div>
             <div className="p-6">
               {tab === 'overview' && <OverviewTab skill={skill} />}
               {tab === 'preview' && <PreviewTab previewQ={previewQ} />}
               {tab === 'files' && <FilesTab previewQ={previewQ} />}
               {tab === 'manifest' && <ManifestTab previewQ={previewQ} />}
+              {tab === 'run' && <RunTab skill={skill} previewQ={previewQ} />}
             </div>
           </div>
         </>
@@ -466,6 +475,262 @@ function FilesTab({
     return <div className="text-sm text-rose-600">{t('skill.filesUnavailable')}</div>;
   const tree = previewQ.data?.file_tree ?? [];
   return <FileTree entries={tree} />;
+}
+/**
+ * Read manifest.run.* config (from cached preview data) and decide whether
+ * the skill can be executed by the server-side runner. Mirrors the logic in
+ * server/src/skill-runner.js#checkRunnable.
+ */
+function isSkillRunnable(preview: PreviewResponse | undefined): boolean {
+  if (!preview) return false;
+  const manifest = preview.manifest as Record<string, unknown> | null;
+  const runCfg = (manifest?.run ?? null) as Record<string, unknown> | null;
+  // Only `node` runtime is supported server-side for now.
+  if (runCfg && typeof runCfg.runtime === 'string' && runCfg.runtime !== 'node') {
+    return false;
+  }
+  const entry =
+    runCfg && typeof runCfg.entry === 'string' ? runCfg.entry : 'scripts/run.js';
+  return preview.file_tree.some((f) => f.type === 'file' && f.path === entry);
+}
+
+function RunTab({
+  skill,
+  previewQ,
+}: {
+  skill: SkillDetail;
+  previewQ: ReturnType<typeof useQuery<PreviewResponse, Error>>;
+}) {
+  const t = useT();
+  const showToast = useStore((s) => s.showToast);
+
+  const preview = previewQ.data;
+  const manifest = (preview?.manifest ?? null) as Record<string, unknown> | null;
+  const runCfg = (manifest?.run ?? null) as Record<string, unknown> | null;
+  const entry =
+    runCfg && typeof runCfg.entry === 'string' ? runCfg.entry : 'scripts/run.js';
+  const timeoutMs =
+    runCfg && Number.isFinite(runCfg.timeout_ms as number)
+      ? (runCfg.timeout_ms as number)
+      : 60_000;
+  const inputExample = runCfg ? runCfg.input_example : undefined;
+
+  const [inputText, setInputText] = useState<string>(() =>
+    inputExample !== undefined ? JSON.stringify(inputExample, null, 2) : '{}',
+  );
+  // If the preview loads after the component mounts (StrictMode etc.), pull
+  // the example into the textarea once it becomes available.
+  useEffect(() => {
+    if (inputExample !== undefined && inputText === '{}') {
+      setInputText(JSON.stringify(inputExample, null, 2));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [JSON.stringify(inputExample)]);
+
+  const [running, setRunning] = useState(false);
+  const [lastResult, setLastResult] = useState<{
+    filename: string;
+    durationMs: number | null;
+  } | null>(null);
+  const [error, setError] = useState<{
+    code: string;
+    message: string;
+    detail?: { stderr?: string; stdout?: string; exitCode?: number };
+  } | null>(null);
+  const [stderrOpen, setStderrOpen] = useState(false);
+
+  if (previewQ.isLoading) {
+    return <Loader2 className="w-5 h-5 animate-spin text-slate-400 mx-auto" />;
+  }
+  if (previewQ.error || !preview) {
+    return <div className="text-sm text-rose-600">{t('skill.previewUnavailable')}</div>;
+  }
+  if (!isSkillRunnable(preview)) {
+    return (
+      <div className="rounded-md bg-slate-50 border border-slate-200 p-4">
+        <div className="font-medium text-slate-700 mb-1">
+          {t('skill.run.notRunnableTitle')}
+        </div>
+        <div className="text-sm text-slate-600">{t('skill.run.notRunnableHint')}</div>
+      </div>
+    );
+  }
+
+  // Validate JSON input
+  let parsedInput: unknown = undefined;
+  let inputError: string | null = null;
+  if (inputText.trim() === '') {
+    parsedInput = {};
+  } else {
+    try {
+      parsedInput = JSON.parse(inputText);
+    } catch (e) {
+      inputError =
+        e instanceof Error ? e.message : t('skill.run.inputInvalid');
+    }
+  }
+  // 1 MB hard cap (server enforces, we surface early)
+  const inputBytes = new Blob([inputText]).size;
+  const tooLarge = inputBytes > 1024 * 1024;
+
+  async function handleRun() {
+    if (inputError || tooLarge) return;
+    setRunning(true);
+    setError(null);
+    setLastResult(null);
+    setStderrOpen(false);
+    try {
+      const result = await postAndDownload(
+        `/skills/${skill.slug}/run`,
+        { input: parsedInput },
+        skill.slug,
+      );
+      setLastResult({ filename: result.filename, durationMs: result.durationMs });
+      showToast(
+        t('skill.run.success', {
+          ms: String(result.durationMs ?? '-'),
+          name: result.filename,
+        }),
+        'success',
+      );
+    } catch (err) {
+      if (err instanceof ApiClientError) {
+        const d = err.detail as
+          | { stderr?: string; stdout?: string; exitCode?: number }
+          | null
+          | undefined;
+        setError({
+          code: err.code,
+          message: err.message,
+          detail: d ?? undefined,
+        });
+      } else {
+        setError({
+          code: 'UNKNOWN',
+          message: err instanceof Error ? err.message : t('skill.run.failed'),
+        });
+      }
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      <div>
+        <h3 className="text-sm font-semibold text-slate-700">{t('skill.run.title')}</h3>
+        <p className="text-xs text-slate-500 mt-1">{t('skill.run.intro')}</p>
+        <div className="mt-2 flex flex-wrap gap-3 text-xs text-slate-500">
+          <span>{t('skill.run.entryHint', { entry })}</span>
+          <span>·</span>
+          <span>
+            {t('skill.run.timeoutHint', { seconds: Math.round(timeoutMs / 1000) })}
+          </span>
+          <span>·</span>
+          <span>{t('skill.run.docsAvailable')}</span>
+        </div>
+      </div>
+
+      <div>
+        <label
+          htmlFor="run-input"
+          className="block text-xs font-medium text-slate-600 mb-1"
+        >
+          {t('skill.run.inputLabel')}
+        </label>
+        <textarea
+          id="run-input"
+          value={inputText}
+          onChange={(e) => setInputText(e.target.value)}
+          placeholder={t('skill.run.inputPlaceholder')}
+          spellCheck={false}
+          rows={10}
+          className={`w-full rounded-md border bg-slate-900 text-slate-100 text-xs font-mono p-3 outline-none ${
+            inputError || tooLarge
+              ? 'border-rose-400 focus:ring-2 focus:ring-rose-300'
+              : 'border-slate-700 focus:ring-2 focus:ring-brand-300'
+          }`}
+        />
+        <div className="mt-1 flex items-center justify-between text-xs">
+          <div className="text-rose-600">
+            {inputError && t('skill.run.inputInvalid')}
+            {!inputError && tooLarge && t('skill.run.inputTooLarge')}
+          </div>
+          <div className="text-slate-400">
+            {(inputBytes / 1024).toFixed(1)} KB / 1024 KB
+          </div>
+        </div>
+      </div>
+
+      <div className="flex items-center gap-3">
+        <button
+          type="button"
+          onClick={handleRun}
+          disabled={running || !!inputError || tooLarge}
+          className="inline-flex items-center gap-2 px-4 py-2 text-sm rounded-md border border-brand-300 bg-brand-50 text-brand-700 hover:bg-brand-100 disabled:opacity-60"
+        >
+          {running ? (
+            <>
+              <Loader2 className="w-4 h-4 animate-spin" />
+              {t('skill.run.running')}
+            </>
+          ) : (
+            <>
+              <Play className="w-4 h-4" />
+              {t('skill.run.button')}
+            </>
+          )}
+        </button>
+        {lastResult && (
+          <span className="inline-flex items-center gap-1.5 text-sm text-emerald-700">
+            <Check className="w-4 h-4" />
+            {t('skill.run.success', {
+              ms: String(lastResult.durationMs ?? '-'),
+              name: lastResult.filename,
+            })}
+          </span>
+        )}
+      </div>
+
+      {error && (
+        <div className="rounded-md bg-rose-50 border border-rose-200 p-3">
+          <div className="flex items-start gap-2">
+            <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+            <div className="min-w-0 flex-1">
+              <div className="text-sm font-medium text-rose-800">
+                {error.code === 'RUN_BUSY'
+                  ? t('skill.run.busy')
+                  : error.code === 'TIMEOUT'
+                    ? t('skill.run.timeout')
+                    : error.code === 'SCRIPT_FAILED'
+                      ? t('skill.run.scriptFailed')
+                      : t('skill.run.failed')}
+              </div>
+              <div className="text-xs text-rose-700 mt-0.5 break-words">
+                <code>{error.code}</code>: {error.message}
+              </div>
+              {error.detail?.stderr && (
+                <div className="mt-2">
+                  <button
+                    type="button"
+                    onClick={() => setStderrOpen((v) => !v)}
+                    className="text-xs underline text-rose-700"
+                  >
+                    {stderrOpen ? t('skill.run.hideStderr') : t('skill.run.viewStderr')}
+                  </button>
+                  {stderrOpen && (
+                    <pre className="mt-1 text-xs bg-slate-900 text-slate-100 rounded-md p-3 overflow-x-auto font-mono whitespace-pre-wrap">
+                      {error.detail.stderr}
+                    </pre>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function ManifestTab({

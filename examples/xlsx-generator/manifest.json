@@ -1,0 +1,21 @@
+{
+  "name": "xlsx-generator",
+  "version": "1.0.0",
+  "description": "Generates an .xlsx spreadsheet from a JSON description.",
+  "run": {
+    "entry": "scripts/run.js",
+    "runtime": "node",
+    "timeout_ms": 30000,
+    "input_example": {
+      "filename": "report.xlsx",
+      "sheetName": "Q3 Sales",
+      "headers": ["Product", "Region", "Units", "Revenue"],
+      "rows": [
+        ["Widget A", "EMEA", 120, 14400],
+        ["Widget A", "APAC", 80, 9600],
+        ["Widget B", "EMEA", 55, 11000],
+        ["Widget B", "APAC", 42, 8400]
+      ]
+    }
+  }
+}

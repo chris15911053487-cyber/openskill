@@ -7,20 +7,24 @@ Upload, review, subscribe, download and preview skill packages from one web app 
 with role-based access (admin / user) and durable, bind-mounted data storage.
 
 ![Status](https://img.shields.io/badge/status-mvp%20complete-green)
-![Tests](https://img.shields.io/badge/tests-29%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-43%20passing-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
 ## What you get
 
 - **Catalog** with full-text search, category filter, tag chips, sort by newest /
   most subscribed / most downloaded
-- **Skill detail page** with four tabs: **Overview** (install commands), **Preview**
-  (live SKILL.md rendering), **Files** (collapsible tree), **Frontmatter** (raw JSON)
+- **Skill detail page** with five tabs: **Overview** (install commands), **Preview**
+  (live SKILL.md rendering), **Files** (collapsible tree), **Frontmatter** (raw JSON),
+  and **Run** (server-side execution → file download)
 - **Upload pipeline** that validates ZIP structure, extracts SKILL.md frontmatter
   (name + description required), parses optional `manifest.json`, computes SHA-256
 - **Two-tier review workflow**: admin uploads publish immediately; user uploads
   enter a review queue with approve / reject (with reason) actions
 - **Subscriptions + downloads** with cached counts and per-user history
+- **Run skill in browser** — for skills containing `scripts/run.js`, click **Run**
+  to execute server-side and have the produced file (.xlsx / .docx / .pdf / …)
+  streamed back as a download. `docx` and `exceljs` are pre-installed
 - **Admin tools**: review queue, categories & tags CRUD, users list, stats dashboard
 - **One-shot Docker deploy** with bind-mounted persistent data
 
@@ -32,7 +36,7 @@ with role-based access (admin / user) and durable, bind-mounted data storage.
 | Frontend | React 19 + Vite 8 + TypeScript + TailwindCSS + Zustand + TanStack Query |
 | Auth | JWT (`@fastify/jwt`) + bcrypt |
 | Skill format | [Anthropic Agent Skills](https://docs.claude.com/en/api/agent-sdk/skills): root `SKILL.md` + optional `scripts/` `references/` `assets/`, packed as ZIP |
-| Tests | `node:test` (built-in), 29 backend tests covering auth, validation, catalog, etc. |
+| Tests | `node:test` (built-in), 43 backend tests covering auth, validation, catalog, server-side skill execution, etc. |
 
 ## Quick start (Docker)
 
@@ -129,6 +133,73 @@ stateDiagram-v2
     Rejected --> [*]: Deleted
 ```
 
+## Runnable skills (server-side execution)
+
+A skill becomes **runnable** when its ZIP contains a Node.js entry script
+(default `scripts/run.js`). On the skill detail page a fifth **Run** tab
+appears. Clicking **Run** sends the JSON shown in the textarea to the
+server, which executes the script in a sandboxed temp directory and streams
+the produced file back to the browser as a download.
+
+```
+my-skill/
+├── SKILL.md
+├── manifest.json        # optional; carries the `run` configuration
+└── scripts/
+    └── run.js           # default entry point
+```
+
+Inside `scripts/run.js`:
+
+| Read from                           | Write to                                |
+|-------------------------------------|------------------------------------------|
+| `process.env.OPENSKILL_INPUT_FILE`  | `process.env.OPENSKILL_OUTPUT_DIR`       |
+| (also piped to stdin)               | one or more files (default cap: 50 MB)   |
+
+The runner spawns `node` with a whitelist of env vars (`PATH`, `HOME`,
+`LANG`, `OPENSKILL_INPUT_FILE`, `OPENSKILL_OUTPUT_DIR`, `NODE_PATH`) and
+**pre-installs `docx` + `exceljs`** via `NODE_PATH`, so a runnable skill
+can `require('docx')` or `require('exceljs')` without bundling them. Any
+extra deps must be vendored inside the ZIP under `node_modules/`.
+
+After the script exits cleanly, the runner:
+
+- **0 files** in `OPENSKILL_OUTPUT_DIR` → 422 `EMPTY_OUTPUT`
+- **1 file** → streamed back, `Content-Type` derived from extension
+- **N files** → bundled into a single `.zip` and streamed
+
+`manifest.json` may carry a `run` block to override defaults:
+
+```json
+{
+  "name": "xlsx-generator",
+  "version": "1.0.0",
+  "run": {
+    "entry": "scripts/run.js",
+    "runtime": "node",
+    "timeout_ms": 30000,
+    "input_example": { "sheetName": "Demo", "rows": [["a", "b"]] }
+  }
+}
+```
+
+`input_example` pre-fills the textarea on the Run tab. `timeout_ms` is
+clamped to `[1000, 300000]`. Only `node` runtime is supported today.
+
+A working example skill is included under `examples/xlsx-generator/`.
+Build it with:
+
+```bash
+node scripts/build-examples.js
+# → examples/dist/xlsx-generator.zip
+```
+
+Then upload the ZIP through the UI and click **Run**.
+
+> Concurrency: a single-flight, process-wide lock. While one run is in
+> progress, additional `/run` requests return 409 `RUN_BUSY`. Designed for
+> small-team / single-user deployments — see Security model for caveats.
+
 ## Architecture
 
 ```
@@ -177,8 +248,10 @@ Key design choices:
 - **Cached preview data** — at upload time, SKILL.md content, file tree, and
   manifest are extracted and stored in DB columns, so the Preview tab never
   re-reads the ZIP.
-- **No execution sandbox** — the platform distributes skills, it does NOT run
-  them. Users download ZIPs and use them locally with Claude Code or the Agent SDK.
+- **Lightweight execution sandbox** — for runnable skills, the platform spawns
+  `node` in a temp directory with a whitelisted env and time/output caps, but
+  **no kernel-level isolation** (no seccomp/cgroups/network policy). Distribute
+  the skill ZIP to local Claude Code / Agent SDK for stronger isolation.
 
 ## Data persistence
 
@@ -257,8 +330,9 @@ Before declaring an upgrade healthy, walk through:
 3. ☐ Log in as `admin`, create a category "Productivity" and tag "writing"
 4. ☐ As admin, upload a valid skill ZIP via the Upload page → status `published`
 5. ☐ Catalog shows the skill, category and tag filters narrow correctly
-6. ☐ Click into the skill → all four tabs render (Overview / Preview / Files /
-     Frontmatter); copy the install command
+6. ☐ Click into the skill → all four content tabs render (Overview / Preview /
+     Files / Frontmatter); copy the install command. If the skill is runnable,
+     a fifth **Run** tab is also visible.
 7. ☐ Subscribe (counter +1) → unsubscribe → re-subscribe
 8. ☐ Click Download → ZIP file is identical to the uploaded one (verify sha256)
 9. ☐ Log out, log in as `alice`. Upload another ZIP → status `pending`
@@ -284,6 +358,7 @@ POST   /skills                         # upload (multipart: file, slug?, categor
 PUT    /skills/:slug                   # re-upload (author or admin)
 DELETE /skills/:slug                   # delete (author or admin)
 GET    /skills/:slug/download          # stream ZIP, increments counter
+POST   /skills/:slug/run                # body: { input }; streams produced file
 POST   /skills/:slug/subscribe
 DELETE /skills/:slug/subscribe
 GET    /skills/:slug/subscription      # { subscribed: bool }
@@ -322,12 +397,15 @@ openskill/
 ├── package.json                # root scripts (dev, build, test)
 ├── README.md                   # this file
 ├── data/                       # ⚠️ runtime state (gitignored)
+├── examples/                   # example runnable skills (xlsx-generator, …)
+│   └── README.md               # runnable-skill contract reference
 ├── scripts/
-│   └── backup.sh               # online SQLite + storage backup
+│   ├── backup.sh               # online SQLite + storage backup
+│   └── build-examples.js       # pack examples/<skill>/ into examples/dist/<skill>.zip
 ├── server/                     # Fastify + better-sqlite3
-│   ├── src/                    # entry, db, auth, validators, routes/*
+│   ├── src/                    # entry, db, auth, validators, skill-runner, routes/*
 │   ├── sql/                    # numbered SQL migrations
-│   └── test/                   # node:test suites (29 tests)
+│   └── test/                   # node:test suites (43 tests)
 └── frontend/                   # React + Vite SPA
     └── src/
         ├── components/         # MainLayout, Toast, SkillMarkdown, FileTree
@@ -439,12 +517,20 @@ What OpenSkill **does** secure:
   trees clean.
 - All errors return a structured JSON shape; stack traces are never leaked
   to the client.
+- **Skill execution** runs in a fresh temp directory with a whitelisted env,
+  a wall-clock timeout (default 60 s, max 300 s), an input cap (1 MB) and an
+  output cap (50 MB). A process-wide lock ensures only one run at a time.
 
 What OpenSkill **does NOT** do (out of scope):
 
-- It does NOT execute skills. There is no sandbox, no Agent SDK runtime
-  embedded. The platform distributes skills only — users execute them locally
-  with Claude Code or the Agent SDK.
+- It does **not** run skills in a hard sandbox. The Run feature spawns
+  `node` as the same OS user as the server itself. There is no kernel-level
+  isolation (no seccomp/landlock/gVisor), no per-skill network policy, no
+  CPU/memory cgroup limits. The intended deployment is **single-user or
+  small-team** with admin-curated skills; treat the Run feature as
+  "RCE-as-a-feature for skills you trust". For untrusted multi-tenant use,
+  add an external sandbox (Firecracker, gVisor, Docker-in-Docker, …) before
+  enabling user uploads of runnable skills.
 - It does NOT scan ZIP contents for malware. Treat published skills as you
   would any third-party code: review the source before installing.
 - It does NOT enforce rate limits out of the box. Put a reverse proxy in

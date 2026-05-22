@@ -1,0 +1,2 @@
+# Built skill ZIPs (regenerate with `node scripts/build-examples.js`)
+dist/

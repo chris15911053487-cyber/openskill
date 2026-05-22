@@ -144,3 +144,62 @@ export async function downloadFile(path: string, suggestedFilename: string): Pro
   // Defer revoking so Safari has time to start the download
   setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
 }
+
+/**
+ * POST a JSON body and download the resulting binary response. Used by the
+ * Run-Skill flow where we want to send `{ input: ... }` and receive a file
+ * (xlsx, docx, ...) back.
+ *
+ * On non-2xx, parses the standard `{ error, code, detail? }` JSON and throws
+ * ApiClientError so callers can show structured errors (including stderr
+ * from a failed script via `err.detail.stderr`).
+ */
+export async function postAndDownload(
+  path: string,
+  body: unknown,
+  fallbackFilename = 'output',
+): Promise<{ filename: string; sizeBytes: number; durationMs: number | null }> {
+  const headers = new Headers();
+  headers.set('content-type', 'application/json');
+  const tok = getToken();
+  if (tok) headers.set('authorization', `Bearer ${tok}`);
+
+  const url = path.startsWith('/api/') ? path : `/api${path.startsWith('/') ? '' : '/'}${path}`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    // Server returns the standard JSON error shape.
+    const text = await res.text();
+    let payload: ApiError = { error: `HTTP ${res.status}`, code: 'UNKNOWN' };
+    try {
+      const parsed = text ? JSON.parse(text) : null;
+      if (parsed && typeof parsed === 'object' && 'error' in parsed) payload = parsed;
+    } catch {
+      /* ignore */
+    }
+    if (res.status === 401 && onUnauthorized) onUnauthorized();
+    throw new ApiClientError(res.status, payload);
+  }
+
+  const cd = res.headers.get('content-disposition') || '';
+  const m = cd.match(/filename="?([^"]+)"?/);
+  const filename = m ? m[1] : fallbackFilename;
+  const durationHeader = res.headers.get('x-openskill-run-duration-ms');
+  const durationMs = durationHeader ? Number(durationHeader) : null;
+
+  const blob = await res.blob();
+  const objectUrl = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = objectUrl;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+
+  return { filename, sizeBytes: blob.size, durationMs };
+}
