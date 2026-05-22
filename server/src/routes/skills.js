@@ -471,6 +471,7 @@ async function skillsRoutes(fastify) {
         result = await runSkill({
           zipBuffer,
           manifest,
+          fileTree,
           input,
           extraNodePaths: [serverNodeModules],
           limits,

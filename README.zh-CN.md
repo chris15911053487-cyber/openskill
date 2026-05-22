@@ -5,7 +5,7 @@
 一个自托管的 **[Anthropic Agent Skills](https://docs.claude.com/en/api/agent-sdk/skills)** 管理平台。在一个 Web 应用里完成上传、审核、订阅、下载和在线预览，支持管理员/普通用户角色，数据通过 bind mount 持久化。
 
 ![Status](https://img.shields.io/badge/status-mvp%20complete-green)
-![Tests](https://img.shields.io/badge/tests-50%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-72%20passing-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
 ## 功能一览
@@ -15,8 +15,9 @@
 - 📦 **严格上传校验** — 自动验证 ZIP 结构，提取 `SKILL.md` frontmatter（必含 `name` 和 `description`），可选解析 `manifest.json`，计算 SHA-256
 - 👨‍⚖️ **双轨审核流程** — 管理员上传立即发布；普通用户上传进入审核队列，管理员可通过/驳回（带理由）；驳回后作者可改后重传
 - ⭐ **订阅 + 下载** — 计数自动维护，含每用户历史
-- ▶️ **浏览器内运行** — 含 `scripts/run.js` 的技能可在详情页点 **Run** 由服务端执行，产出的 `.xlsx` / `.docx` / `.pdf` 等文件流回浏览器；服务端预装 `docx` 和 `exceljs`
-- 💬 **对话 + 工具调用** — 在 Chat 里和 LLM（默认 DeepSeek，任意 OpenAI 兼容端点）聊天，并把可运行的技能挂上对话；LLM 会**真的**调用 `run_skill` 工具，产出的文件作为可下载的 artifact 出现在消息气泡里——不再有"我把文件放在 artifacts/"的幻觉
+- ▶️ **浏览器内运行** — 含 `scripts/run.js`（Node）或 `scripts/run.py`（Python）的技能可在详情页点 **Run** 由服务端执行，产出的 `.xlsx` / `.docx` / `.pdf` 等文件流回浏览器。Node 运行时预装 `docx` + `exceljs`；Python 运行时预装 `pandas` + `openpyxl` + `python-docx` + `pdfplumber` + `Pillow` + `lxml`
+- 🤖 **Agent 模式** — 严格按 Anthropic 原始规范写的声明式 skill（只有 `SKILL.md` + 资源，无 entry 脚本）会被自动识别为 agent 模式：LLM 拿到的不是 `run_skill`，而是 `run_python_code` 工具，**临场写 Python** 操作 skill bundle，产出文件作为 artifact 出现在对话里
+- 💬 **对话 + 工具调用** — 在 Chat 里和 LLM（默认 DeepSeek，通过 `LLM_API_KEY` 等任意 OpenAI 兼容端点）聊天，并把可运行/agent 模式的技能挂上对话；LLM 会**真的**调用工具，产出的文件作为可下载的 artifact 出现在消息气泡里——不再有"我把文件放在 artifacts/"的幻觉
 - 🛠️ **管理后台** — 审核队列、分类与标签 CRUD、用户列表、统计仪表板
 - 🐳 **一键 Docker 部署** — 数据持久化通过 bind mount，重建镜像不丢数据
 
@@ -28,7 +29,7 @@
 | 前端 | React 19 + Vite 8 + TypeScript + TailwindCSS + Zustand + TanStack Query |
 | 认证 | JWT（`@fastify/jwt`）+ bcrypt（rounds=12） |
 | Skill 格式 | [Anthropic Agent Skills](https://docs.claude.com/en/api/agent-sdk/skills)：根 `SKILL.md` + 可选 `scripts/` `references/` `assets/`，打包为 ZIP |
-| 测试 | `node:test`（Node.js 内建），50 个测试覆盖认证、校验、目录、服务端技能执行、对话工具调用等 |
+| 测试 | `node:test`（Node.js 内建），72 个测试覆盖认证、校验、目录、Node + Python 技能执行、对话工具调用（`run_skill` 与 agent 模式的 `run_python_code`）等 |
 
 ## 快速开始（Docker）
 
@@ -125,24 +126,34 @@ stateDiagram-v2
 
 ## 可运行技能（服务端执行）
 
-当 ZIP 包含 Node.js 入口脚本（默认 `scripts/run.js`），技能就变成 **可运行的**。详情页会出现第 5 个 **Run** Tab：用户在文本框里贴 JSON 输入，点 Run，服务端在隔离的临时目录里执行脚本，产出的文件作为下载流回浏览器。
+只要 ZIP 含一个 runner 能识别的入口脚本，技能就变成 **可运行的**：
+
+| 入口                  | 运行时   | 预装库                                                          |
+|----------------------|---------|---------------------------------------------------------------|
+| `scripts/run.js`     | Node    | `docx`、`exceljs`、`adm-zip`、`js-yaml`（通过 `NODE_PATH`）       |
+| `scripts/run.py`     | Python  | `openpyxl`、`pandas`、`python-docx`、`pdfplumber`、`Pillow`、`lxml`（通过 `PYTHONPATH`） |
+
+详情页会出现第 5 个 **Run** Tab：用户在文本框里贴 JSON 输入，点 Run，服务端在隔离的临时目录里执行脚本，产出的文件作为下载流回浏览器。
 
 ```
 my-skill/
 ├── SKILL.md
 ├── manifest.json        # 可选；用 `run` 字段配置执行行为
 └── scripts/
-    └── run.js           # 默认入口
+    ├── run.js           # Node 入口（默认）
+    └── run.py           # Python 入口（备选）
 ```
 
-`scripts/run.js` 的协议：
+如果 `run.js` 与 `run.py` 同时存在，为保持向后兼容会优先使用 Node 入口。
+
+`scripts/run.{js,py}` 的协议：
 
 | 输入                                | 输出                                  |
 |-------------------------------------|---------------------------------------|
 | `process.env.OPENSKILL_INPUT_FILE`  | `process.env.OPENSKILL_OUTPUT_DIR`    |
 | （同时通过 stdin 提供）              | 一个或多个文件（默认上限 50 MB）      |
 
-Runner 用白名单环境变量（`PATH`、`HOME`、`LANG`、`OPENSKILL_INPUT_FILE`、`OPENSKILL_OUTPUT_DIR`、`NODE_PATH`）spawn `node`，并通过 `NODE_PATH` **预装 `docx` + `exceljs`**，所以可运行技能可以直接 `require('docx')` 或 `require('exceljs')`，无需打包。其他依赖请把 `node_modules/` 一起塞进 ZIP。
+Runner 用白名单环境变量（`PATH`、`HOME`、`LANG`、`OPENSKILL_INPUT_FILE`、`OPENSKILL_OUTPUT_DIR`，加上 `NODE_PATH` 或 `PYTHONPATH`）spawn 解释器，并预装上表中的库。Node 的额外依赖请把 `node_modules/` 一起塞进 ZIP；Python 的额外依赖暂时需保持精简（自动 `pip install` 暂未实现，规划中）。
 
 脚本正常退出后，runner：
 
@@ -154,31 +165,52 @@ Runner 用白名单环境变量（`PATH`、`HOME`、`LANG`、`OPENSKILL_INPUT_FI
 
 ```json
 {
-  "name": "xlsx-generator",
+  "name": "csv-cleaner",
   "version": "1.0.0",
   "run": {
-    "entry": "scripts/run.js",
-    "runtime": "node",
+    "entry": "scripts/run.py",
+    "runtime": "python",
     "timeout_ms": 30000,
-    "input_example": { "sheetName": "Demo", "rows": [["a", "b"]] }
+    "input_example": { "csv": "name,score\nalice,10\n" }
   }
 }
 ```
 
-`input_example` 会预填 Run Tab 的输入框。`timeout_ms` 在 `[1000, 300000]` 区间夹紧。目前只支持 `node` 运行时。
+`input_example` 会预填 Run Tab 的输入框。`timeout_ms` 在 `[1000, 300000]` 区间夹紧。`runtime` 支持 `node`（默认）和 `python`；省略时也会从 `entry` 的扩展名自动推断。
 
-仓库里 `examples/xlsx-generator/` 是一个完整可用的示例。打包：
+仓库里 `examples/` 目录下提供了完整可用的示例：
+
+| 示例                            | 运行时  | 演示内容                                              |
+|--------------------------------|---------|-------------------------------------------------------|
+| `examples/xlsx-generator/`     | Node    | `exceljs`，多行电子表格生成                            |
+| `examples/csv-cleaner/`        | Python  | `pandas` + `openpyxl`，CSV → 清洗后的 `.xlsx`         |
+
+打包：
 
 ```bash
 node scripts/build-examples.js
 # → examples/dist/xlsx-generator.zip
+# → examples/dist/csv-cleaner.zip
 ```
 
-通过 UI 上传这个 ZIP 然后点 **Run** 即可试用。
+通过 UI 上传这些 ZIP 然后点 **Run** 即可试用。
 
 > **并发**：进程级单 flight 锁。当一个运行进行中时，第二个 `/run` 请求直接返回 409 `RUN_BUSY`。这是为单用户/小团队部署设计的，多租户使用前请先加外部沙箱。
 
 > **安全提醒**：当前不做硬隔离（无 seccomp / cgroups / 网络策略），脚本以服务进程同样的 OS 用户运行。**只对你审核过的技能开放运行**。要让陌生人上传可运行技能，请先接 Firecracker / gVisor / Docker-in-Docker 等外部沙箱。
+
+## Agent 模式（声明式技能）
+
+按原始 Anthropic Agent Skill 规范写的技能 —— 只有 `SKILL.md` + 资源，**没有 `scripts/run.{js,py}` entry** —— 在 Run Tab 里跑不起来（没东西可执行），但平台会在它被挂到对话上时自动启用 **agent 模式**：
+
+- LLM 拿到的工具不再是 `run_skill`，而是 `run_python_code`，参数 `{ code: string, stdin?: string }`
+- 用户每次发消息时，skill ZIP 会被解压到一个全新的临时目录；LLM 写出来的 `code` 直接用 Python 3 执行，CWD 就是 skill bundle 的根，`scripts/`、模板和资源都在原位
+- 预装库 `openpyxl` / `pandas` / `python-docx` / `pdfplumber` / `Pillow` / `lxml` 通过 `PYTHONPATH` 暴露；LibreOffice (`soffice`) 也在 `PATH` 上，可以用来重算公式或做格式转换
+- 任何写到 `os.environ['OPENSKILL_OUTPUT_DIR']` 下的文件都会作为 artifact 挂到这条 assistant 消息上 —— 落盘 / 下载链路和普通 Run 路径完全一致
+
+发给 LLM 的 system prompt = skill 的 `SKILL.md` + 一段固定追加内容，明确禁止幻觉文件、要求每个交付物必须来自一次成功的 `run_python_code` 调用。
+
+限制和安全模型与 Run 路径完全一致：默认 60 秒墙钟超时、50 MB 输出上限、1 MB 代码上限、进程级单 flight 锁、无内核级隔离。Agent 模式的对话沿用同一信任假设 —— **只挂载你已审核过的技能**。
 
 ## Chat 对话与工具调用
 
@@ -201,9 +233,11 @@ LLM 继续生成 → "已经为你生成了…"
 ### 工具是怎么暴露给 LLM 的
 
 - 一个对话最多挂 0 或 1 个 skill（`PATCH /chat/conversations/:id` body 里 `{skill_id}`）
-- 当这个 skill 是可运行的，**只有一个工具** `run_skill` 会暴露给 LLM；其 JSON-Schema 来自 `manifest.run.input_schema`，没声明则用 `{type:"object", additionalProperties:true}`
-- skill 的 `SKILL.md` 内容用作 system prompt，外加一段反幻觉提示，明确告诉模型必须真的调用工具，不能编造文件
-- 目前只暴露 `run_skill`，其他工具（web search、code interpreter 等）暂不在范围
+- 工具暴露**与 skill 模式互斥**：
+  - skill 含 `scripts/run.js` 或 `scripts/run.py` → 暴露 `run_skill`，JSON-Schema 来自 `manifest.run.input_schema`，没声明则用 `{type:"object", additionalProperties:true}`
+  - skill 只有 `SKILL.md`（agent 模式）→ 暴露 `run_python_code`，参数 `{code: string, stdin?: string}`
+- skill 的 `SKILL.md` 内容用作 system prompt，外加一段反幻觉提示，明确告诉模型必须真的调用工具，不能编造文件；agent 模式下还会追加 Python 运行时的使用规则
+- 目前只暴露这两个互斥工具，其他工具（web search、code interpreter 等）暂不在范围
 
 ### 循环与限制
 
@@ -376,7 +410,7 @@ openskill/
 ├── server/                     # Fastify + better-sqlite3
 │   ├── src/                    # 入口、db、auth、validators、skill-runner、routes/*
 │   ├── sql/                    # 顺序编号的 SQL 迁移
-│   └── test/                   # node:test 测试套件（50 个）
+│   └── test/                   # node:test 测试套件（72 个）
 └── frontend/                   # React + Vite SPA
     └── src/
         ├── components/         # MainLayout、Toast、SkillMarkdown、FileTree

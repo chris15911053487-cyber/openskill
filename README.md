@@ -7,7 +7,7 @@ Upload, review, subscribe, download and preview skill packages from one web app 
 with role-based access (admin / user) and durable, bind-mounted data storage.
 
 ![Status](https://img.shields.io/badge/status-mvp%20complete-green)
-![Tests](https://img.shields.io/badge/tests-50%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-72%20passing-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
 ## What you get
@@ -22,9 +22,15 @@ with role-based access (admin / user) and durable, bind-mounted data storage.
 - **Two-tier review workflow**: admin uploads publish immediately; user uploads
   enter a review queue with approve / reject (with reason) actions
 - **Subscriptions + downloads** with cached counts and per-user history
-- **Run skill in browser** — for skills containing `scripts/run.js`, click **Run**
-  to execute server-side and have the produced file (.xlsx / .docx / .pdf / …)
-  streamed back as a download. `docx` and `exceljs` are pre-installed
+- **Run skill in browser** — for skills containing `scripts/run.js` (Node) or
+  `scripts/run.py` (Python), click **Run** to execute server-side and have
+  the produced file (.xlsx / .docx / .pdf / …) streamed back as a download.
+  Node runtime ships with `docx` + `exceljs`; Python runtime ships with
+  `pandas` + `openpyxl` + `python-docx` + `pdfplumber` + `Pillow` + `lxml`
+- **Agent mode** — Anthropic-style declarative skills (just `SKILL.md` + assets,
+  no entry script) are auto-detected; the LLM gets a `run_python_code` tool
+  that executes Python 3 against the unzipped bundle. The user sees the
+  produced file as a real downloadable artifact in the chat
 - **Chat with skills + tool calling** — talk to an LLM (any OpenAI-compatible
   endpoint, DeepSeek by default) and it can _actually_ call attached runnable
   skills via tool calling; the produced files become real downloadable
@@ -40,7 +46,7 @@ with role-based access (admin / user) and durable, bind-mounted data storage.
 | Frontend | React 19 + Vite 8 + TypeScript + TailwindCSS + Zustand + TanStack Query |
 | Auth | JWT (`@fastify/jwt`) + bcrypt |
 | Skill format | [Anthropic Agent Skills](https://docs.claude.com/en/api/agent-sdk/skills): root `SKILL.md` + optional `scripts/` `references/` `assets/`, packed as ZIP |
-| Tests | `node:test` (built-in), 50 backend tests covering auth, validation, catalog, server-side skill execution, chat tool-calling, etc. |
+| Tests | `node:test` (built-in), 72 backend tests covering auth, validation, catalog, Node + Python skill execution, chat tool-calling (`run_skill` and agent-mode `run_python_code`), etc. |
 
 ## Quick start (Docker)
 
@@ -139,32 +145,44 @@ stateDiagram-v2
 
 ## Runnable skills (server-side execution)
 
-A skill becomes **runnable** when its ZIP contains a Node.js entry script
-(default `scripts/run.js`). On the skill detail page a fifth **Run** tab
-appears. Clicking **Run** sends the JSON shown in the textarea to the
-server, which executes the script in a sandboxed temp directory and streams
-the produced file back to the browser as a download.
+A skill becomes **runnable** when its ZIP contains an entry script the
+runner recognises:
+
+| Entry                  | Runtime  | Pre-installed libs                                          |
+|------------------------|----------|-------------------------------------------------------------|
+| `scripts/run.js`       | Node     | `docx`, `exceljs`, `adm-zip`, `js-yaml` (via `NODE_PATH`)   |
+| `scripts/run.py`       | Python   | `openpyxl`, `pandas`, `python-docx`, `pdfplumber`, `Pillow`, `lxml` (via `PYTHONPATH`) |
+
+On the skill detail page a fifth **Run** tab appears for either runtime.
+Clicking **Run** sends the JSON shown in the textarea to the server, which
+executes the entry script in a sandboxed temp directory and streams the
+produced file back to the browser as a download.
 
 ```
 my-skill/
 ├── SKILL.md
 ├── manifest.json        # optional; carries the `run` configuration
 └── scripts/
-    └── run.js           # default entry point
+    ├── run.js           # Node entry (default)
+    └── run.py           # Python entry (alternative)
 ```
 
-Inside `scripts/run.js`:
+If both `run.js` and `run.py` exist the Node entry wins for back-compat.
+
+Inside `scripts/run.{js,py}`:
 
 | Read from                           | Write to                                |
 |-------------------------------------|------------------------------------------|
 | `process.env.OPENSKILL_INPUT_FILE`  | `process.env.OPENSKILL_OUTPUT_DIR`       |
 | (also piped to stdin)               | one or more files (default cap: 50 MB)   |
 
-The runner spawns `node` with a whitelist of env vars (`PATH`, `HOME`,
-`LANG`, `OPENSKILL_INPUT_FILE`, `OPENSKILL_OUTPUT_DIR`, `NODE_PATH`) and
-**pre-installs `docx` + `exceljs`** via `NODE_PATH`, so a runnable skill
-can `require('docx')` or `require('exceljs')` without bundling them. Any
-extra deps must be vendored inside the ZIP under `node_modules/`.
+The runner spawns the interpreter with a whitelist of env vars (`PATH`,
+`HOME`, `LANG`, `OPENSKILL_INPUT_FILE`, `OPENSKILL_OUTPUT_DIR`, plus
+`NODE_PATH` or `PYTHONPATH`) and pre-installs the libraries listed above.
+Extra Node deps must be vendored under `node_modules/`; extra Python deps
+must be vendored under a directory exposed via the manifest (or, for
+Phase 1, kept lean — automatic per-skill `pip install` is not yet
+implemented).
 
 After the script exits cleanly, the runner:
 
@@ -176,26 +194,35 @@ After the script exits cleanly, the runner:
 
 ```json
 {
-  "name": "xlsx-generator",
+  "name": "csv-cleaner",
   "version": "1.0.0",
   "run": {
-    "entry": "scripts/run.js",
-    "runtime": "node",
+    "entry": "scripts/run.py",
+    "runtime": "python",
     "timeout_ms": 30000,
-    "input_example": { "sheetName": "Demo", "rows": [["a", "b"]] }
+    "input_example": { "csv": "name,score\nalice,10\n" }
   }
 }
 ```
 
 `input_example` pre-fills the textarea on the Run tab. `timeout_ms` is
-clamped to `[1000, 300000]`. Only `node` runtime is supported today.
+clamped to `[1000, 300000]`. Supported `runtime` values: `node` (default)
+and `python`. The runtime can also be inferred from `entry`'s file
+extension when omitted.
 
-A working example skill is included under `examples/xlsx-generator/`.
-Build it with:
+Working examples are included under `examples/`:
+
+| Example                         | Runtime  | Demonstrates                                          |
+|---------------------------------|----------|-------------------------------------------------------|
+| `examples/xlsx-generator/`      | Node     | `exceljs`, multi-row spreadsheet generation           |
+| `examples/csv-cleaner/`         | Python   | `pandas` + `openpyxl`, CSV → cleaned `.xlsx`          |
+
+Build them with:
 
 ```bash
 node scripts/build-examples.js
 # → examples/dist/xlsx-generator.zip
+# → examples/dist/csv-cleaner.zip
 ```
 
 Then upload the ZIP through the UI and click **Run**.
@@ -203,6 +230,35 @@ Then upload the ZIP through the UI and click **Run**.
 > Concurrency: a single-flight, process-wide lock. While one run is in
 > progress, additional `/run` requests return 409 `RUN_BUSY`. Designed for
 > small-team / single-user deployments — see Security model for caveats.
+
+## Agent mode (declarative skills)
+
+Skills that follow the original Anthropic Agent Skill spec — just a
+`SKILL.md` + supporting assets, **no `scripts/run.{js,py}` entry** — are
+not directly runnable from the Run tab (there's nothing to execute), but
+the platform automatically promotes them to **agent mode** when they are
+attached to a chat:
+
+- The LLM is given a tool called `run_python_code` instead of `run_skill`.
+  Its parameters are `{ code: string, stdin?: string }`.
+- The skill ZIP is extracted into a fresh temp directory, and the LLM-
+  supplied `code` is executed as Python 3 with the bundle's `scripts/`,
+  templates and assets at the current working directory.
+- Pre-installed libs (`openpyxl`, `pandas`, `python-docx`, `pdfplumber`,
+  `Pillow`, `lxml`) are on `PYTHONPATH`. LibreOffice (`soffice`) is on
+  `PATH` for spreadsheet recalc / format conversion.
+- Any file written under `os.environ['OPENSKILL_OUTPUT_DIR']` becomes a
+  downloadable artifact attached to the assistant message — same plumbing
+  as the regular Run path.
+
+The system prompt sent to the LLM is the skill's `SKILL.md` plus a fixed
+addendum that forbids hallucinating outputs and requires every deliverable
+to come from a successful `run_python_code` tool result.
+
+Limits and security model are identical to the regular Run path: 60 s
+default wall-clock timeout, 50 MB output cap, 1 MB code cap, single-flight
+process-wide lock, no kernel-level isolation. Agent-mode chats inherit the
+same trust assumptions — only attach skills you have audited.
 
 ## Chat with skills (LLM tool calling)
 
@@ -231,15 +287,18 @@ chat UI renders the assistant text + a download chip linked to the artifact
 
 - A conversation has zero or one attached skill (`PATCH /chat/conversations/:id`
   with `{skill_id}`).
-- If the attached skill is runnable, exactly one tool — `run_skill` — is
-  exposed to the LLM. Its JSON-schema parameters come from
-  `manifest.run.input_schema` if declared, otherwise `{type:"object", additionalProperties:true}`.
+- Tool exposure depends on the skill mode and is **exclusive**:
+  - Skills containing `scripts/run.js` or `scripts/run.py` → one tool
+    `run_skill`. Its JSON-schema parameters come from `manifest.run.input_schema`
+    if declared, otherwise `{type:"object", additionalProperties:true}`.
+  - Skills with only `SKILL.md` (agent mode) → one tool `run_python_code`
+    with parameters `{code: string, stdin?: string}`.
 - The skill's `SKILL.md` content is the system prompt; an extra
   anti-hallucination block tells the model to call the tool instead of
-  pretending a file exists. (This is the fix for "I've saved the file in
-  artifacts/" hallucinations.)
-- Only the `run_skill` tool is exposed today; other tools (web search, code
-  interpreter, etc.) are out of scope.
+  pretending a file exists. Agent-mode chats receive an additional block
+  that documents the Python runtime contract.
+- Only those two mutually-exclusive tools are exposed today; other tools
+  (web search, code interpreter, etc.) are out of scope.
 
 ### Loop & limits
 
@@ -487,7 +546,7 @@ openskill/
 ├── server/                     # Fastify + better-sqlite3
 │   ├── src/                    # entry, db, auth, validators, skill-runner, routes/*
 │   ├── sql/                    # numbered SQL migrations
-│   └── test/                   # node:test suites (50 tests)
+│   └── test/                   # node:test suites (72 tests)
 └── frontend/                   # React + Vite SPA
     └── src/
         ├── components/         # MainLayout, Toast, SkillMarkdown, FileTree

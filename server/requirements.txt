@@ -1,0 +1,15 @@
+# Pre-installed Python libraries for skill execution.
+#
+# These are exposed to skills via PYTHONPATH (system site-packages on Debian)
+# so a `scripts/run.py` or LLM-written agent code can `import openpyxl` etc.
+# without bundling them in the skill ZIP.
+#
+# Pinned to known-good versions; bumping requires re-running the
+# server tests + the example skill end-to-end.
+
+openpyxl==3.1.5
+python-docx==1.1.2
+pandas==2.2.3
+pdfplumber==0.11.4
+Pillow==11.0.0
+lxml==5.3.0

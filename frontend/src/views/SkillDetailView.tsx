@@ -479,19 +479,44 @@ function FilesTab({
 /**
  * Read manifest.run.* config (from cached preview data) and decide whether
  * the skill can be executed by the server-side runner. Mirrors the logic in
- * server/src/skill-runner.js#checkRunnable.
+ * server/src/skill-runner.js#detectExecutionMode.
+ *
+ * "Runnable" here means the Run tab is shown (Node OR Python entry script
+ * exists). Agent-mode skills (no entry, just SKILL.md) are NOT considered
+ * runnable from the detail view — they only surface through the Chat tab,
+ * where the LLM uses `run_python_code` to execute against the bundle.
  */
 function isSkillRunnable(preview: PreviewResponse | undefined): boolean {
   if (!preview) return false;
   const manifest = preview.manifest as Record<string, unknown> | null;
   const runCfg = (manifest?.run ?? null) as Record<string, unknown> | null;
-  // Only `node` runtime is supported server-side for now.
-  if (runCfg && typeof runCfg.runtime === 'string' && runCfg.runtime !== 'node') {
+
+  const declaredEntry =
+    runCfg && typeof runCfg.entry === 'string' ? runCfg.entry : null;
+  const declaredRuntime =
+    runCfg && typeof runCfg.runtime === 'string' ? runCfg.runtime : null;
+
+  // Reject runtimes we don't support.
+  if (
+    declaredRuntime &&
+    declaredRuntime !== 'node' &&
+    declaredRuntime !== 'python'
+  ) {
     return false;
   }
-  const entry =
-    runCfg && typeof runCfg.entry === 'string' ? runCfg.entry : 'scripts/run.js';
-  return preview.file_tree.some((f) => f.type === 'file' && f.path === entry);
+
+  const hasFile = (p: string) =>
+    preview.file_tree.some((f) => f.type === 'file' && f.path === p);
+
+  if (declaredEntry) {
+    if (declaredEntry.endsWith('.js') || declaredEntry.endsWith('.py')) {
+      return hasFile(declaredEntry);
+    }
+    return false;
+  }
+
+  // No explicit entry → check default file presence.
+  return hasFile('scripts/run.js') || hasFile('scripts/run.py');
 }
 
 function RunTab({
@@ -507,8 +532,18 @@ function RunTab({
   const preview = previewQ.data;
   const manifest = (preview?.manifest ?? null) as Record<string, unknown> | null;
   const runCfg = (manifest?.run ?? null) as Record<string, unknown> | null;
-  const entry =
-    runCfg && typeof runCfg.entry === 'string' ? runCfg.entry : 'scripts/run.js';
+  const declaredEntry =
+    runCfg && typeof runCfg.entry === 'string' ? runCfg.entry : null;
+  // If the manifest doesn't declare an entry, infer from file tree —
+  // scripts/run.js wins over scripts/run.py for back-compat.
+  const fileTree = preview?.file_tree ?? [];
+  const inferredEntry =
+    fileTree.some((f) => f.type === 'file' && f.path === 'scripts/run.js')
+      ? 'scripts/run.js'
+      : fileTree.some((f) => f.type === 'file' && f.path === 'scripts/run.py')
+        ? 'scripts/run.py'
+        : 'scripts/run.js';
+  const entry = declaredEntry || inferredEntry;
   const timeoutMs =
     runCfg && Number.isFinite(runCfg.timeout_ms as number)
       ? (runCfg.timeout_ms as number)

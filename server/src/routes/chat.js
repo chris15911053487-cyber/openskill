@@ -3,7 +3,8 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { llmTurn } = require('../llm');
-const { runSkill, checkRunnable } = require('../skill-runner');
+const { runSkill, detectExecutionMode } = require('../skill-runner');
+const { runPythonCode } = require('../python-exec');
 const { saveArtifact, resolveArtifactPath } = require('../artifact-storage');
 
 const DEFAULT_SYSTEM_PROMPT = 'You are a helpful AI assistant.';
@@ -13,8 +14,9 @@ const DEFAULT_SYSTEM_PROMPT = 'You are a helpful AI assistant.';
 const MAX_TOOL_ITERATIONS = 3;
 
 // Appended to the system prompt when the conversation has a runnable skill
-// attached. Critical to prevent the model from hallucinating "I created the
-// file" instead of actually invoking the tool.
+// attached (Node OR Python entry script). Critical to prevent the model
+// from hallucinating "I created the file" instead of actually invoking
+// the tool.
 const RUNNABLE_TOOL_HINT = `
 You have access to a tool named "run_skill" that executes the attached skill server-side and produces a downloadable file.
 
@@ -25,35 +27,104 @@ RULES:
 4. If the tool returns ok=false, briefly explain the failure and suggest a fix; do not retry blindly.
 `.trim();
 
+// Appended to the system prompt for "agent mode" skills — the ones that
+// have a SKILL.md but no entry script. These are the Anthropic-style
+// declarative skills (xlsx, text-to-issuelist, ...). The LLM writes Python
+// 3 against the bundled templates / assets at runtime.
+const AGENT_TOOL_HINT = `
+You are running INSIDE an OpenSkill agent runtime. The tool \`run_python_code\` lets you execute arbitrary Python 3 against this skill's bundle. The bundle's \`scripts/\` directory is at your CWD; templates / assets the skill ships are in their original relative paths.
+
+Pre-installed libraries: openpyxl, pandas, python-docx, pdfplumber, Pillow, lxml. LibreOffice (\`soffice\` / \`libreoffice\`) is on PATH for formula recalc / format conversion.
+
+RULES:
+1. When the user asks for a deliverable, you MUST call run_python_code instead of describing the result in prose. Do NOT pretend a file was generated unless the tool returned a successful result for it in this turn.
+2. Write output files to \`os.environ['OPENSKILL_OUTPUT_DIR']\`. The runtime will attach them to your reply automatically — do NOT invent download URLs.
+3. The skill's CWD is the unzipped skill bundle. Read templates with relative paths (e.g. \`openpyxl.load_workbook('模板/foo.xlsx')\`).
+4. After run_python_code returns, briefly tell the user the file is ready.
+5. If the tool returns ok=false, briefly explain the failure; don't blindly retry.
+`.trim();
+
 /**
- * Build the OpenAI-shape `tools` array for an attached skill, if it is
- * runnable. Returns [] otherwise.
+ * Build the OpenAI-shape `tools` array for an attached skill.
+ *
+ * Decides between three exclusive shapes:
+ *   - 'node' / 'python' entry → one tool named "run_skill"
+ *   - 'agent' (no entry)      → one tool named "run_python_code"
+ *   - 'none' / unsupported    → []
+ *
+ * Returns { tools, hint, mode } so the caller can apply the matching
+ * system-prompt addendum.
  */
 function buildTools(skill, manifest, fileTree) {
-  if (!skill) return [];
-  const reason = checkRunnable(fileTree, manifest);
-  if (reason) return [];
+  if (!skill) return { tools: [], hint: null, mode: 'none' };
+  const detected = detectExecutionMode(fileTree, manifest);
 
-  let parameters;
-  const declared = manifest?.run?.input_schema;
-  if (declared && typeof declared === 'object' && !Array.isArray(declared)) {
-    parameters = declared;
-  } else {
-    parameters = { type: 'object', additionalProperties: true };
+  if (detected.mode === 'node' || detected.mode === 'python') {
+    let parameters;
+    const declared = manifest?.run?.input_schema;
+    if (declared && typeof declared === 'object' && !Array.isArray(declared)) {
+      parameters = declared;
+    } else {
+      parameters = { type: 'object', additionalProperties: true };
+    }
+
+    const desc = `Execute the "${skill.name}" skill on the server and attach the produced file to your reply.\n\nSkill description: ${skill.description || ''}`.trim();
+
+    return {
+      tools: [
+        {
+          type: 'function',
+          function: {
+            name: 'run_skill',
+            description: desc,
+            parameters,
+          },
+        },
+      ],
+      hint: RUNNABLE_TOOL_HINT,
+      mode: detected.mode,
+    };
   }
 
-  const desc = `Execute the "${skill.name}" skill on the server and attach the produced file to your reply.\n\nSkill description: ${skill.description || ''}`.trim();
+  if (detected.mode === 'agent') {
+    const desc =
+      `Execute Python 3 code inside the "${skill.name}" skill bundle. ` +
+      `The skill's scripts/, templates and other files are available at the current working directory. ` +
+      `Output files written under $OPENSKILL_OUTPUT_DIR will be attached to your reply as downloadable artifacts.\n\n` +
+      `Skill description: ${skill.description || ''}`.trim();
 
-  return [
-    {
-      type: 'function',
-      function: {
-        name: 'run_skill',
-        description: desc,
-        parameters,
-      },
-    },
-  ];
+    return {
+      tools: [
+        {
+          type: 'function',
+          function: {
+            name: 'run_python_code',
+            description: desc,
+            parameters: {
+              type: 'object',
+              required: ['code'],
+              properties: {
+                code: {
+                  type: 'string',
+                  description:
+                    "Python 3 code to execute. Use openpyxl/pandas/python-docx/pdfplumber as needed. " +
+                    "Write outputs to os.environ['OPENSKILL_OUTPUT_DIR'].",
+                },
+                stdin: {
+                  type: 'string',
+                  description: "Optional: text fed to the script's stdin.",
+                },
+              },
+            },
+          },
+        },
+      ],
+      hint: AGENT_TOOL_HINT,
+      mode: 'agent',
+    };
+  }
+
+  return { tools: [], hint: null, mode: detected.mode };
 }
 
 /**
@@ -290,10 +361,14 @@ async function chatRoutes(app) {
         }
       }
 
-      const tools = buildTools(skillRow, manifest, fileTree);
+      const { tools, hint: toolHint, mode: skillMode } = buildTools(
+        skillRow,
+        manifest,
+        fileTree,
+      );
       let systemPrompt = DEFAULT_SYSTEM_PROMPT;
       if (skillRow?.skill_md_content) systemPrompt = skillRow.skill_md_content;
-      if (tools.length > 0) systemPrompt += '\n\n---\n\n' + RUNNABLE_TOOL_HINT;
+      if (toolHint) systemPrompt += '\n\n---\n\n' + toolHint;
 
       // Build the OpenAI-shape history. We pass {role, content} pairs from
       // the DB; tool exchanges are appended in-memory inside the loop and
@@ -366,11 +441,17 @@ async function chatRoutes(app) {
 
             let toolResultPayload;
 
-            if (tc.name !== 'run_skill') {
+            // Allowed tool names are gated by skillMode:
+            //   node | python → run_skill
+            //   agent         → run_python_code
+            const expectedTool =
+              skillMode === 'agent' ? 'run_python_code' : 'run_skill';
+
+            if (tc.name !== expectedTool) {
               toolResultPayload = {
                 ok: false,
                 code: 'UNKNOWN_TOOL',
-                message: `Unknown tool: ${tc.name}`,
+                message: `Unknown tool: ${tc.name} (expected ${expectedTool})`,
               };
               send({ tool_error: toolResultPayload });
             } else if (!skillRow || !zipBuffer) {
@@ -394,14 +475,6 @@ async function chatRoutes(app) {
               }
 
               if (!toolResultPayload) {
-                // Some tool callers (Claude-style or DeepSeek) wrap the
-                // user-facing input under a top-level `input` key. Accept
-                // either shape.
-                const skillInput =
-                  parsedArgs && typeof parsedArgs === 'object' && 'input' in parsedArgs
-                    ? parsedArgs.input
-                    : parsedArgs;
-
                 try {
                   const limits = {};
                   if (manifest?.run && Number.isFinite(manifest.run.timeout_ms)) {
@@ -413,13 +486,47 @@ async function chatRoutes(app) {
                     '..',
                     'node_modules',
                   );
-                  const runResult = await runSkill({
-                    zipBuffer,
-                    manifest,
-                    input: skillInput ?? {},
-                    extraNodePaths: [serverNodeModules],
-                    limits,
-                  });
+
+                  let runResult;
+                  if (tc.name === 'run_skill') {
+                    // Some tool callers (Claude-style or DeepSeek) wrap the
+                    // user-facing input under a top-level `input` key.
+                    // Accept either shape.
+                    const skillInput =
+                      parsedArgs && typeof parsedArgs === 'object' && 'input' in parsedArgs
+                        ? parsedArgs.input
+                        : parsedArgs;
+                    runResult = await runSkill({
+                      zipBuffer,
+                      manifest,
+                      fileTree,
+                      input: skillInput ?? {},
+                      extraNodePaths: [serverNodeModules],
+                      limits,
+                    });
+                  } else {
+                    // run_python_code
+                    const code =
+                      parsedArgs && typeof parsedArgs.code === 'string'
+                        ? parsedArgs.code
+                        : '';
+                    const stdin =
+                      parsedArgs && typeof parsedArgs.stdin === 'string'
+                        ? parsedArgs.stdin
+                        : '';
+                    if (!code.trim()) {
+                      throw Object.assign(new Error('`code` parameter is required'), {
+                        code: 'BAD_ARGUMENTS',
+                      });
+                    }
+                    runResult = await runPythonCode({
+                      zipBuffer,
+                      manifest,
+                      code,
+                      stdin,
+                      limits,
+                    });
+                  }
 
                   // Buffer artifact in memory; we'll persist after we know
                   // the assistant message_id at the end of the turn.

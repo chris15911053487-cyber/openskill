@@ -1,0 +1,18 @@
+{
+  "name": "csv-cleaner",
+  "version": "1.0.0",
+  "description": "Cleans a CSV and exports it as a formatted .xlsx workbook (Python).",
+  "run": {
+    "entry": "scripts/run.py",
+    "runtime": "python",
+    "timeout_ms": 30000,
+    "input_example": {
+      "csv": "name, score\n alice ,10\nbob,20\n alice ,10\n carol,30\n",
+      "filename": "cleaned.xlsx",
+      "sheetName": "cleaned",
+      "dedupColumns": ["name"],
+      "trim": true,
+      "dropEmptyRows": true
+    }
+  }
+}
