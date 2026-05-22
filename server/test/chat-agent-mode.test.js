@@ -470,44 +470,89 @@ test('agent-mode: bad python code surfaces SCRIPT_FAILED via tool_error', {
   assert.strictEqual(finalEv.message.artifacts.length, 0);
 });
 
-test('agent-mode: python code that produces nothing → EMPTY_OUTPUT tool_error', {
+test('agent-mode: python code that produces no file → tool_done with no_file=true and stdout (recon-friendly)', {
   skip: !PYTHON_AVAILABLE,
 }, async (t) => {
+  // EMPTY_OUTPUT used to surface as tool_error which made DeepSeek give up
+  // when its first call was a recon ("look at the bundle, decide what to
+  // do next"). The new behavior is: a successful exit with zero files is
+  // surfaced as tool_done { no_file: true, stdout, stderr } so the model
+  // can read the recon results and chain a real generation call.
   const tmp = freshEnv();
   const fastify = await bootServer(t, tmp);
   const token = await loginAs(fastify, 'rootadmin', 'rootpass');
   const skill = await uploadAgentOnlyAsAdmin(fastify, token);
 
-  installMockFetch(t, [
+  // The model writes a real file on its second attempt after seeing the
+  // recon stdout in the tool_result.
+  const reconCode = "print('files:', __import__('os').listdir('.'))";
+  const realCode =
+    "import os\n" +
+    "with open(os.path.join(os.environ['OPENSKILL_OUTPUT_DIR'], 'final.txt'), 'w', encoding='utf-8') as f:\n" +
+    "    f.write('done')\n";
+
+  const captured = [];
+  installMockFetch(
+    t,
     [
-      dataChunk({
-        choices: [
-          {
-            delta: {
-              tool_calls: [
-                {
-                  index: 0,
-                  id: 'silent',
-                  type: 'function',
-                  function: {
-                    name: 'run_python_code',
-                    arguments: JSON.stringify({ code: 'print("nothing written")' }),
+      // Iter 0: recon
+      [
+        dataChunk({
+          choices: [
+            {
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: 'recon_call',
+                    type: 'function',
+                    function: {
+                      name: 'run_python_code',
+                      arguments: JSON.stringify({ code: reconCode }),
+                    },
                   },
-                },
-              ],
+                ],
+              },
             },
-          },
-        ],
-      }),
-      dataChunk({ choices: [{ delta: {}, finish_reason: 'tool_calls' }] }),
-      doneChunk(),
+          ],
+        }),
+        dataChunk({ choices: [{ delta: {}, finish_reason: 'tool_calls' }] }),
+        doneChunk(),
+      ],
+      // Iter 1: real generation (still tool_choice=required because no
+      // artifact yet)
+      [
+        dataChunk({
+          choices: [
+            {
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: 'real_call',
+                    type: 'function',
+                    function: {
+                      name: 'run_python_code',
+                      arguments: JSON.stringify({ code: realCode }),
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+        dataChunk({ choices: [{ delta: {}, finish_reason: 'tool_calls' }] }),
+        doneChunk(),
+      ],
+      // Iter 2: now that artifact landed, model summarises in plain text
+      [
+        dataChunk({ choices: [{ delta: { content: 'Done — file is ready.' } }] }),
+        dataChunk({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+        doneChunk(),
+      ],
     ],
-    [
-      dataChunk({ choices: [{ delta: { content: 'no file produced' } }] }),
-      dataChunk({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
-      doneChunk(),
-    ],
-  ]);
+    captured,
+  );
 
   const conv = await fastify.inject({
     method: 'POST',
@@ -525,12 +570,34 @@ test('agent-mode: python code that produces nothing → EMPTY_OUTPUT tool_error'
   assert.strictEqual(res.statusCode, 200);
 
   const events = parseClientSse(res.body);
-  const toolError = events.find((e) => e.tool_error);
-  assert.ok(toolError);
-  assert.strictEqual(toolError.tool_error.code, 'EMPTY_OUTPUT');
 
+  // The recon turn surfaces as tool_done with no_file=true (NOT tool_error)
+  const reconDone = events.find(
+    (e) => e.tool_done && e.tool_done.no_file === true,
+  );
+  assert.ok(reconDone, 'expected tool_done {no_file:true} for recon turn');
+  // No tool_error fired
+  assert.strictEqual(events.some((e) => e.tool_error), false);
+
+  // tool_choice escalation: iter 0 = required, iter 1 = required (no
+  // artifact yet), iter 2 = auto (artifact landed)
+  assert.strictEqual(captured[0].tool_choice, 'required');
+  assert.strictEqual(captured[1].tool_choice, 'required');
+  assert.strictEqual(captured[2].tool_choice, 'auto');
+
+  // The recon stdout was piped back to the model in iter 1's history
+  const iter1ToolMsg = captured[1].messages.find((m) => m.role === 'tool');
+  assert.ok(iter1ToolMsg, 'iter 1 must include tool result message');
+  // The tool result should mention the stdout (it included the listdir output)
+  assert.match(iter1ToolMsg.content, /no_file/);
+  assert.match(iter1ToolMsg.content, /files:|\.py|\.md/);
+
+  // Final assistant message has the real artifact + the wrap-up text
   const finalEv = events.find((e) => e.message);
-  assert.strictEqual(finalEv.message.artifacts.length, 0);
+  assert.ok(finalEv);
+  assert.strictEqual(finalEv.message.content, 'Done — file is ready.');
+  assert.strictEqual(finalEv.message.artifacts.length, 1);
+  assert.strictEqual(finalEv.message.artifacts[0].filename, 'final.txt');
 });
 
 test('agent-mode: empty `code` argument → BAD_ARGUMENTS tool_error', async (t) => {

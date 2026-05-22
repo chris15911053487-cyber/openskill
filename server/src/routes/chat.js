@@ -13,6 +13,17 @@ const DEFAULT_SYSTEM_PROMPT = 'You are a helpful AI assistant.';
 // runaway loop if the model decides to keep calling the tool forever.
 const MAX_TOOL_ITERATIONS = 3;
 
+// Cap on stdout/stderr we ship back to the LLM in tool_result. Big enough
+// to carry useful recon output (file lists, sheet names, etc.) but small
+// enough that we don't blow the model's context window.
+const MAX_STDIO_FOR_MODEL = 4 * 1024;
+
+function truncateForModel(s) {
+  if (typeof s !== 'string' || s.length === 0) return '';
+  if (s.length <= MAX_STDIO_FOR_MODEL) return s;
+  return s.slice(0, MAX_STDIO_FOR_MODEL) + '\n…[truncated]';
+}
+
 // Appended to the system prompt when the conversation has a runnable skill
 // attached (Node OR Python entry script). Critical to prevent the model
 // from hallucinating "I created the file" instead of actually invoking
@@ -65,10 +76,12 @@ The SKILL.md content that follows below was authored for the original Anthropic 
 
 RULES:
 1. When the user asks for a deliverable, you MUST call \`run_python_code\` with real Python that produces the file. Do NOT just promise to do it in prose. "好的，我来处理" / "let me start working on it" with no tool call is FORBIDDEN.
-2. Write output files to \`os.environ['OPENSKILL_OUTPUT_DIR']\`. Do NOT invent download URLs or claim a file was saved unless the tool returned ok=true for it in this turn.
-3. After \`run_python_code\` returns successfully, send a short reply telling the user the file is ready (the UI will render the download chip automatically).
-4. If the tool returns ok=false, briefly explain the failure based on stderr and try a corrected version once. Do not retry blindly more than once.
-5. If you genuinely need information from the user before you can run code (e.g. company name to fill into a template), ask ONCE concisely; once they answer, immediately call the tool.
+2. Write output files to \`os.environ['OPENSKILL_OUTPUT_DIR']\`. Do NOT invent download URLs or claim a file was saved unless the tool returned ok=true with a non-empty filename.
+3. Tool results include \`stdout\` and \`stderr\` (truncated). Use them. If you ran a reconnaissance script first (e.g. \`os.listdir(...)\`, \`get_workbook_summary\`), the results come back via stdout — read them and adapt your next call.
+4. If a tool result has \`no_file: true\`, that means your code ran successfully but didn't write anything. This is fine for recon, but your NEXT call MUST write the actual deliverable to OPENSKILL_OUTPUT_DIR.
+5. After a tool call returns ok=true with a real filename, send a short reply telling the user the file is ready (the UI will render the download chip automatically).
+6. If the tool returns ok=false, briefly explain the failure based on stderr and try a corrected version once. Do not retry blindly more than once.
+7. If you genuinely need information from the user before you can run code (e.g. company name to fill into a template), ask ONCE concisely; once they answer, immediately call the tool.
 `.trim();
 
 /**
@@ -450,12 +463,18 @@ async function chatRoutes(app) {
           let turnText = '';
           const turnToolCalls = [];
 
-          // First iteration: force the model to call a tool. This defeats
-          // DeepSeek's habit of replying in prose ("好的，我来处理…") even
-          // when the user clearly asked for a deliverable. Subsequent
-          // iterations (after a tool result) drop back to 'auto' so the
-          // model can write a natural language summary.
-          const toolChoice = iter === 0 && tools.length > 0 ? 'required' : 'auto';
+          // tool_choice escalation:
+          //   - First iteration: force a tool call (defeats DeepSeek's
+          //     habit of replying in prose for clear deliverable requests).
+          //   - Subsequent iterations: keep forcing while no artifact has
+          //     been collected yet (allows recon-then-generate chains).
+          //     Once an artifact lands, drop to 'auto' so the model can
+          //     write a natural-language summary.
+          let toolChoice = 'auto';
+          if (tools.length > 0) {
+            if (iter === 0) toolChoice = 'required';
+            else if (pendingArtifacts.length === 0) toolChoice = 'required';
+          }
 
           for await (const ev of llmTurn({
             systemPrompt,
@@ -596,6 +615,11 @@ async function chatRoutes(app) {
                     content_type: runResult.contentType,
                     size_bytes: runResult.data.length,
                     duration_ms: runResult.durationMs,
+                    // Pipe stdout/stderr (truncated) back so the model can
+                    // confirm what its code observed during this turn —
+                    // critical for chained calls (recon → real run).
+                    stdout: truncateForModel(runResult.stdout),
+                    stderr: truncateForModel(runResult.stderr),
                     note:
                       'The file has been attached to your reply. The user will see ' +
                       'a download button automatically — do not invent links.',
@@ -609,12 +633,42 @@ async function chatRoutes(app) {
                     },
                   });
                 } catch (err) {
-                  toolResultPayload = {
-                    ok: false,
-                    code: err.code || 'RUN_FAILED',
-                    message: err.message,
-                  };
-                  send({ tool_error: toolResultPayload });
+                  // EMPTY_OUTPUT is special: the script ran successfully, it
+                  // just didn't produce a file. Common, legitimate case is
+                  // a "recon" run (the model wants to look at the bundle
+                  // before generating output). Surface it as ok=true with a
+                  // hint that no file was produced; otherwise the model
+                  // sees a bare "failure" with no info and tends to give up.
+                  if (err.code === 'EMPTY_OUTPUT') {
+                    toolResultPayload = {
+                      ok: true,
+                      no_file: true,
+                      message:
+                        'Code executed successfully but produced no file. ' +
+                        'If this was a reconnaissance run, the next call should ' +
+                        'write the deliverable to OPENSKILL_OUTPUT_DIR.',
+                      stdout: truncateForModel(err.detail?.stdout),
+                      stderr: truncateForModel(err.detail?.stderr),
+                    };
+                    send({
+                      tool_done: {
+                        filename: null,
+                        content_type: null,
+                        size_bytes: 0,
+                        duration_ms: 0,
+                        no_file: true,
+                      },
+                    });
+                  } else {
+                    toolResultPayload = {
+                      ok: false,
+                      code: err.code || 'RUN_FAILED',
+                      message: err.message,
+                      stdout: truncateForModel(err.detail?.stdout),
+                      stderr: truncateForModel(err.detail?.stderr),
+                    };
+                    send({ tool_error: toolResultPayload });
+                  }
                 }
               }
             }
