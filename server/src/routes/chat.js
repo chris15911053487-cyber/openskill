@@ -11,7 +11,16 @@ const DEFAULT_SYSTEM_PROMPT = 'You are a helpful AI assistant.';
 
 // Cap how many tool calls a single user message can trigger. Prevents a
 // runaway loop if the model decides to keep calling the tool forever.
-const MAX_TOOL_ITERATIONS = 3;
+//
+// Layout for agent-mode interactions:
+//   iter 0..MAX-2 → may force tool_choice='required' to defeat
+//                   DeepSeek's prose-instead-of-tool habit
+//   iter MAX-1    → always 'auto' so the model has a chance to write
+//                   a natural-language clarifying question or summary
+//                   (e.g. "I need the company name to fill the template").
+// 4 lets a recon → recon → generate chain finish AND still leaves one
+// auto turn at the end for the wrap-up / clarifying message.
+const MAX_TOOL_ITERATIONS = 4;
 
 // Cap on stdout/stderr we ship back to the LLM in tool_result. Big enough
 // to carry useful recon output (file lists, sheet names, etc.) but small
@@ -466,12 +475,19 @@ async function chatRoutes(app) {
           // tool_choice escalation:
           //   - First iteration: force a tool call (defeats DeepSeek's
           //     habit of replying in prose for clear deliverable requests).
-          //   - Subsequent iterations: keep forcing while no artifact has
-          //     been collected yet (allows recon-then-generate chains).
-          //     Once an artifact lands, drop to 'auto' so the model can
-          //     write a natural-language summary.
+          //   - Subsequent iterations except the last: keep forcing while
+          //     no artifact has been collected yet (allows recon-then-
+          //     generate chains).
+          //   - Last iteration (iter === MAX-1): always 'auto'. This is
+          //     the model's escape valve — if it has been recon'ing for
+          //     N rounds and still can't produce a file (typically
+          //     because it needs information from the user, e.g. a
+          //     company name to fill into a template), this gives it a
+          //     chance to ask the user via natural-language text instead
+          //     of silently exiting the loop.
           let toolChoice = 'auto';
-          if (tools.length > 0) {
+          const isLastIter = iter === MAX_TOOL_ITERATIONS - 1;
+          if (tools.length > 0 && !isLastIter) {
             if (iter === 0) toolChoice = 'required';
             else if (pendingArtifacts.length === 0) toolChoice = 'required';
           }
