@@ -7,7 +7,7 @@ Upload, review, subscribe, download and preview skill packages from one web app 
 with role-based access (admin / user) and durable, bind-mounted data storage.
 
 ![Status](https://img.shields.io/badge/status-mvp%20complete-green)
-![Tests](https://img.shields.io/badge/tests-74%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-76%20passing-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
 ## What you get
@@ -46,7 +46,7 @@ with role-based access (admin / user) and durable, bind-mounted data storage.
 | Frontend | React 19 + Vite 8 + TypeScript + TailwindCSS + Zustand + TanStack Query |
 | Auth | JWT (`@fastify/jwt`) + bcrypt |
 | Skill format | [Anthropic Agent Skills](https://docs.claude.com/en/api/agent-sdk/skills): root `SKILL.md` + optional `scripts/` `references/` `assets/`, packed as ZIP |
-| Tests | `node:test` (built-in), 74 backend tests covering auth, validation, catalog, Node + Python skill execution, chat tool-calling (`run_skill` and agent-mode `run_python_code`), etc. |
+| Tests | `node:test` (built-in), 76 backend tests covering auth, validation, catalog, Node + Python skill execution, chat tool-calling (`run_skill` and agent-mode `run_python_code`), etc. |
 
 ## Quick start (Docker)
 
@@ -546,7 +546,7 @@ openskill/
 ├── server/                     # Fastify + better-sqlite3
 │   ├── src/                    # entry, db, auth, validators, skill-runner, routes/*
 │   ├── sql/                    # numbered SQL migrations
-│   └── test/                   # node:test suites (74 tests)
+│   └── test/                   # node:test suites (76 tests)
 └── frontend/                   # React + Vite SPA
     └── src/
         ├── components/         # MainLayout, Toast, SkillMarkdown, FileTree

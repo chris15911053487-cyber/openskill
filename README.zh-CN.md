@@ -5,7 +5,7 @@
 一个自托管的 **[Anthropic Agent Skills](https://docs.claude.com/en/api/agent-sdk/skills)** 管理平台。在一个 Web 应用里完成上传、审核、订阅、下载和在线预览，支持管理员/普通用户角色，数据通过 bind mount 持久化。
 
 ![Status](https://img.shields.io/badge/status-mvp%20complete-green)
-![Tests](https://img.shields.io/badge/tests-74%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-76%20passing-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
 ## 功能一览
@@ -29,7 +29,7 @@
 | 前端 | React 19 + Vite 8 + TypeScript + TailwindCSS + Zustand + TanStack Query |
 | 认证 | JWT（`@fastify/jwt`）+ bcrypt（rounds=12） |
 | Skill 格式 | [Anthropic Agent Skills](https://docs.claude.com/en/api/agent-sdk/skills)：根 `SKILL.md` + 可选 `scripts/` `references/` `assets/`，打包为 ZIP |
-| 测试 | `node:test`（Node.js 内建），74 个测试覆盖认证、校验、目录、Node + Python 技能执行、对话工具调用（`run_skill` 与 agent 模式的 `run_python_code`）等 |
+| 测试 | `node:test`（Node.js 内建），76 个测试覆盖认证、校验、目录、Node + Python 技能执行、对话工具调用（`run_skill` 与 agent 模式的 `run_python_code`）等 |
 
 ## 快速开始（Docker）
 
@@ -410,7 +410,7 @@ openskill/
 ├── server/                     # Fastify + better-sqlite3
 │   ├── src/                    # 入口、db、auth、validators、skill-runner、routes/*
 │   ├── sql/                    # 顺序编号的 SQL 迁移
-│   └── test/                   # node:test 测试套件（74 个）
+│   └── test/                   # node:test 测试套件（76 个）
 └── frontend/                   # React + Vite SPA
     └── src/
         ├── components/         # MainLayout、Toast、SkillMarkdown、FileTree

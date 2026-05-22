@@ -450,10 +450,18 @@ async function chatRoutes(app) {
           let turnText = '';
           const turnToolCalls = [];
 
+          // First iteration: force the model to call a tool. This defeats
+          // DeepSeek's habit of replying in prose ("好的，我来处理…") even
+          // when the user clearly asked for a deliverable. Subsequent
+          // iterations (after a tool result) drop back to 'auto' so the
+          // model can write a natural language summary.
+          const toolChoice = iter === 0 && tools.length > 0 ? 'required' : 'auto';
+
           for await (const ev of llmTurn({
             systemPrompt,
             messages: history,
             tools,
+            toolChoice,
           })) {
             if (ev.type === 'text') {
               turnText += ev.delta;

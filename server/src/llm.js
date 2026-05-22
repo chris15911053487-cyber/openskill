@@ -73,9 +73,15 @@ async function streamChat({ systemPrompt, messages }) {
  * @param {string} [args.systemPrompt]
  * @param {Array<object>} args.messages              — full OpenAI-shape history
  * @param {Array<object>} [args.tools]               — OpenAI-shape tools array
+ * @param {'auto'|'required'|'none'|object} [args.toolChoice]
+ *      — passed through as `tool_choice`. 'required' forces the model to
+ *        call one of the exposed tools (useful for the very first turn of
+ *        a tool-using user message, where we want to defeat DeepSeek's
+ *        habit of replying in prose). Defaults to 'auto' when tools are
+ *        provided, omitted otherwise.
  * @param {object} [args.deps]                       — for tests: { fetch }
  */
-async function* llmTurn({ systemPrompt, messages, tools, deps }) {
+async function* llmTurn({ systemPrompt, messages, tools, toolChoice, deps }) {
   const fetchFn = deps?.fetch || fetch;
   const { apiKey, apiUrl, model } = llmConfig();
 
@@ -84,13 +90,12 @@ async function* llmTurn({ systemPrompt, messages, tools, deps }) {
     ...messages,
   ];
 
+  const hasTools = Array.isArray(tools) && tools.length > 0;
   const body = {
     model,
     stream: true,
     messages: fullMessages,
-    ...(Array.isArray(tools) && tools.length > 0
-      ? { tools, tool_choice: 'auto' }
-      : {}),
+    ...(hasTools ? { tools, tool_choice: toolChoice ?? 'auto' } : {}),
   };
 
   const res = await fetchFn(apiUrl, {

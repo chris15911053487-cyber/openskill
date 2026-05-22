@@ -898,3 +898,156 @@ test('agent-mode regression: with no SKILL.md content the hint still appears alo
   // No "domain context" header since SKILL.md is empty
   assert.doesNotMatch(sys.content, /Skill domain context/);
 });
+
+// ===========================================================================
+// Regression: tool_choice escalation
+//
+// With tool_choice='auto' DeepSeek occasionally chats back instead of
+// calling the tool, especially after a clarifying-question round. We force
+// 'required' on the FIRST iteration of each user turn so the model must
+// emit a tool_call. Subsequent iterations (post-tool-result) drop back to
+// 'auto' so the model can write a natural language summary.
+//
+// This test asserts both halves of that contract by inspecting what we
+// send to the LLM on each iteration of a tool round-trip.
+// ===========================================================================
+
+test('agent-mode: tool_choice = required on iter 0, auto on iter 1', {
+  skip: !PYTHON_AVAILABLE,
+}, async (t) => {
+  const tmp = freshEnv();
+  const fastify = await bootServer(t, tmp);
+  const token = await loginAs(fastify, 'rootadmin', 'rootpass');
+  const skill = await uploadAgentOnlyAsAdmin(fastify, token);
+
+  // Tiny working code so the run actually completes
+  const llmCode =
+    "import os\n" +
+    "with open(os.path.join(os.environ['OPENSKILL_OUTPUT_DIR'], 'r.txt'), 'w', encoding='utf-8') as f:\n" +
+    "    f.write('done')\n";
+
+  const captured = [];
+  installMockFetch(
+    t,
+    [
+      // Iter 0: model emits a real tool_call
+      [
+        dataChunk({
+          choices: [
+            {
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: 'call_iter0',
+                    type: 'function',
+                    function: { name: 'run_python_code', arguments: '' },
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+        dataChunk({
+          choices: [
+            {
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    function: { arguments: JSON.stringify({ code: llmCode }) },
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+        dataChunk({ choices: [{ delta: {}, finish_reason: 'tool_calls' }] }),
+        doneChunk(),
+      ],
+      // Iter 1: plain text wrap-up
+      [
+        dataChunk({ choices: [{ delta: { content: 'Done.' } }] }),
+        dataChunk({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+        doneChunk(),
+      ],
+    ],
+    captured,
+  );
+
+  const conv = await fastify.inject({
+    method: 'POST',
+    url: '/api/chat/conversations',
+    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+    payload: JSON.stringify({ skill_id: skill.id }),
+  });
+  const convId = conv.json().id;
+
+  const res = await fastify.inject({
+    method: 'POST',
+    url: `/api/chat/conversations/${convId}/messages`,
+    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+    payload: JSON.stringify({ content: '生成一个文件' }),
+  });
+  assert.strictEqual(res.statusCode, 200);
+
+  // Iter 0 must have forced tool use
+  assert.ok(captured.length >= 2, `expected 2 LLM calls, got ${captured.length}`);
+  assert.strictEqual(
+    captured[0].tool_choice,
+    'required',
+    `iter 0 should force tool_choice=required, got ${JSON.stringify(captured[0].tool_choice)}`,
+  );
+  // Iter 1 (after tool result) must relax to auto so the model can summarise
+  assert.strictEqual(
+    captured[1].tool_choice,
+    'auto',
+    `iter 1 should be tool_choice=auto, got ${JSON.stringify(captured[1].tool_choice)}`,
+  );
+
+  // Sanity: artifact landed (both halves of the loop ran)
+  const events = parseClientSse(res.body);
+  const finalEv = events.find((e) => e.message);
+  assert.strictEqual(finalEv.message.artifacts.length, 1);
+});
+
+test('agent-mode: with no tools (skill mode = none) tool_choice is omitted', async (t) => {
+  // Sanity: no skill attached → no tools → llmTurn must NOT send tool_choice,
+  // otherwise OpenAI-compatible APIs reject the request.
+  const tmp = freshEnv();
+  const fastify = await bootServer(t, tmp);
+  const token = await loginAs(fastify, 'rootadmin', 'rootpass');
+
+  const captured = [];
+  installMockFetch(
+    t,
+    [
+      [
+        dataChunk({ choices: [{ delta: { content: 'hi' } }] }),
+        dataChunk({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+        doneChunk(),
+      ],
+    ],
+    captured,
+  );
+
+  const conv = await fastify.inject({
+    method: 'POST',
+    url: '/api/chat/conversations',
+    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+    payload: '{}',
+  });
+  const convId = conv.json().id;
+
+  const res = await fastify.inject({
+    method: 'POST',
+    url: `/api/chat/conversations/${convId}/messages`,
+    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+    payload: JSON.stringify({ content: 'hi' }),
+  });
+  assert.strictEqual(res.statusCode, 200);
+
+  // Plain chat with no skill: tool_choice must not appear in the request.
+  assert.strictEqual(captured[0].tool_choice, undefined);
+  assert.ok(!captured[0].tools || captured[0].tools.length === 0);
+});
