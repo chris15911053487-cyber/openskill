@@ -210,6 +210,12 @@ export const en = {
   'chat.noSkillsFound': 'No matching skills',
   'chat.deleteConfirm': 'Delete this conversation?',
   'chat.untitled': 'New chat',
+  'chat.toolCalling': 'Running {name}…',
+  'chat.toolDone': 'Generated {name} ({size}) in {ms} ms',
+  'chat.toolError': 'Skill run failed: {message}',
+  'chat.downloadArtifact': 'Download',
+  'chat.artifactCount': '{n} attached',
+  'chat.runnableHint': 'This skill can produce files — ask for one and it will run automatically.',
 
   // Admin: Review Queue
   'review.title': 'Review queue',

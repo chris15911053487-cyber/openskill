@@ -17,10 +17,13 @@ import {
   Loader2,
   Sparkles,
   X as XIcon,
+  Download,
+  Wrench,
+  AlertCircle,
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { api, getToken } from '../utils/api';
+import { api, downloadFile, getToken } from '../utils/api';
 import { useT } from '../store';
 import type { SkillListResponse, SkillSummary } from '../domain';
 
@@ -35,12 +38,35 @@ interface Conversation {
   updated_at: string;
 }
 
+interface Artifact {
+  id: number;
+  message_id: number;
+  filename: string;
+  content_type: string;
+  size_bytes: number;
+  skill_slug: string | null;
+  created_at: string;
+}
+
 interface Message {
   id: number;
   conversation_id: number;
   role: 'user' | 'assistant';
   content: string;
   created_at: string;
+  artifacts?: Artifact[];
+}
+
+type ToolStatus =
+  | { kind: 'idle' }
+  | { kind: 'calling'; name: string }
+  | { kind: 'done'; filename: string; sizeBytes: number; durationMs: number }
+  | { kind: 'error'; message: string };
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 export function ChatView() {
@@ -182,6 +208,7 @@ function ChatPanel({ conversation }: { conversation: Conversation }) {
   const [input, setInput] = useState('');
   const [streaming, setStreaming] = useState(false);
   const [streamContent, setStreamContent] = useState('');
+  const [toolStatus, setToolStatus] = useState<ToolStatus>({ kind: 'idle' });
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
@@ -200,6 +227,7 @@ function ChatPanel({ conversation }: { conversation: Conversation }) {
     setInput('');
     setStreamContent('');
     setStreaming(false);
+    setToolStatus({ kind: 'idle' });
   }, [conversation.id]);
 
   const scrollToBottom = useCallback(() => {
@@ -249,6 +277,9 @@ function ChatPanel({ conversation }: { conversation: Conversation }) {
     setInput('');
     setStreaming(true);
     setStreamContent('');
+    setToolStatus({ kind: 'idle' });
+
+    let finalAssistantMsg: Message | null = null;
 
     try {
       const token = getToken();
@@ -270,38 +301,94 @@ function ChatPanel({ conversation }: { conversation: Conversation }) {
 
       const reader = res.body!.getReader();
       const decoder = new TextDecoder();
+      let buffer = '';
       let full = '';
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        const chunk = decoder.decode(value, { stream: true });
-        const lines = chunk.split('\n');
-        for (const line of lines) {
+        buffer += decoder.decode(value, { stream: true });
+        let nl: number;
+        while ((nl = buffer.indexOf('\n')) !== -1) {
+          const line = buffer.slice(0, nl).trim();
+          buffer = buffer.slice(nl + 1);
           if (!line.startsWith('data: ')) continue;
           const data = line.slice(6);
           if (data === '[DONE]') continue;
+          let parsed: Record<string, unknown>;
           try {
-            const parsed = JSON.parse(data);
-            if (parsed.content) {
-              full += parsed.content;
-              setStreamContent(full);
-            }
+            parsed = JSON.parse(data);
           } catch {
-            /* skip */
+            continue;
+          }
+          // Text delta
+          if (typeof parsed.content === 'string') {
+            full += parsed.content;
+            setStreamContent(full);
+            continue;
+          }
+          // Tool-call lifecycle
+          if (parsed.tool_call && typeof parsed.tool_call === 'object') {
+            const tc = parsed.tool_call as { name?: string };
+            setToolStatus({ kind: 'calling', name: tc.name || 'tool' });
+            continue;
+          }
+          if (parsed.tool_done && typeof parsed.tool_done === 'object') {
+            const td = parsed.tool_done as {
+              filename?: string;
+              size_bytes?: number;
+              duration_ms?: number;
+            };
+            setToolStatus({
+              kind: 'done',
+              filename: td.filename || 'output',
+              sizeBytes: td.size_bytes || 0,
+              durationMs: td.duration_ms || 0,
+            });
+            continue;
+          }
+          if (parsed.tool_error && typeof parsed.tool_error === 'object') {
+            const te = parsed.tool_error as { message?: string };
+            setToolStatus({ kind: 'error', message: te.message || 'unknown error' });
+            continue;
+          }
+          // Final assistant message metadata (with persisted artifacts)
+          if (parsed.message && typeof parsed.message === 'object') {
+            const fm = parsed.message as {
+              id: number | null;
+              content?: string;
+              artifacts?: Artifact[];
+            };
+            if (fm.id) {
+              finalAssistantMsg = {
+                id: fm.id,
+                conversation_id: conversation.id,
+                role: 'assistant',
+                content: fm.content ?? full,
+                created_at: new Date().toISOString(),
+                artifacts: fm.artifacts || [],
+              };
+            }
+            continue;
           }
         }
       }
 
-      if (full) {
-        const assistantMsg: Message = {
-          id: Date.now() + 1,
-          conversation_id: conversation.id,
-          role: 'assistant',
-          content: full,
-          created_at: new Date().toISOString(),
-        };
-        setMessages((prev) => [...prev, assistantMsg]);
+      // Prefer the server-confirmed message (with real id + artifacts) over
+      // an in-memory stub built from the streamed text.
+      if (finalAssistantMsg) {
+        setMessages((prev) => [...prev, finalAssistantMsg!]);
+      } else if (full) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: Date.now() + 1,
+            conversation_id: conversation.id,
+            role: 'assistant',
+            content: full,
+            created_at: new Date().toISOString(),
+          },
+        ]);
       }
       qc.invalidateQueries({ queryKey: ['conversations'] });
     } catch (err) {
@@ -309,6 +396,9 @@ function ChatPanel({ conversation }: { conversation: Conversation }) {
     } finally {
       setStreaming(false);
       setStreamContent('');
+      // Don't clear toolStatus immediately; clearing on next send keeps the
+      // last-run note visible briefly. (Reset on conversation switch and
+      // on next sendMessage().)
     }
   };
 
@@ -360,17 +450,26 @@ function ChatPanel({ conversation }: { conversation: Conversation }) {
         )}
         {messages.map((m) => (
           <div key={m.id} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-            <div
-              className={`max-w-[80%] rounded-2xl px-4 py-2.5 text-sm ${
-                m.role === 'user'
-                  ? 'bg-brand-600 text-white'
-                  : 'bg-slate-50 border border-slate-200 prose prose-sm max-w-none'
-              }`}
-            >
-              {m.role === 'assistant' ? (
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.content}</ReactMarkdown>
-              ) : (
-                <span className="whitespace-pre-wrap">{m.content}</span>
+            <div className={`max-w-[80%] flex flex-col gap-2 ${m.role === 'user' ? 'items-end' : 'items-start'}`}>
+              <div
+                className={`rounded-2xl px-4 py-2.5 text-sm ${
+                  m.role === 'user'
+                    ? 'bg-brand-600 text-white'
+                    : 'bg-slate-50 border border-slate-200 prose prose-sm max-w-none'
+                }`}
+              >
+                {m.role === 'assistant' ? (
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.content}</ReactMarkdown>
+                ) : (
+                  <span className="whitespace-pre-wrap">{m.content}</span>
+                )}
+              </div>
+              {m.artifacts && m.artifacts.length > 0 && (
+                <div className="flex flex-col gap-1.5">
+                  {m.artifacts.map((a) => (
+                    <ArtifactChip key={a.id} artifact={a} />
+                  ))}
+                </div>
               )}
             </div>
           </div>
@@ -382,10 +481,38 @@ function ChatPanel({ conversation }: { conversation: Conversation }) {
             </div>
           </div>
         )}
-        {streaming && !streamContent && (
+        {streaming && !streamContent && toolStatus.kind === 'idle' && (
           <div className="flex justify-start">
             <div className="rounded-2xl px-4 py-2.5 bg-slate-50 border border-slate-200">
               <Loader2 className="w-4 h-4 animate-spin text-slate-400" />
+            </div>
+          </div>
+        )}
+        {streaming && toolStatus.kind === 'calling' && (
+          <div className="flex justify-start">
+            <div className="inline-flex items-center gap-2 rounded-full px-3 py-1.5 bg-brand-50 border border-brand-200 text-xs text-brand-700">
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              {t('chat.toolCalling', { name: toolStatus.name })}
+            </div>
+          </div>
+        )}
+        {streaming && toolStatus.kind === 'done' && (
+          <div className="flex justify-start">
+            <div className="inline-flex items-center gap-2 rounded-full px-3 py-1.5 bg-emerald-50 border border-emerald-200 text-xs text-emerald-700">
+              <Wrench className="w-3.5 h-3.5" />
+              {t('chat.toolDone', {
+                name: toolStatus.filename,
+                size: formatBytes(toolStatus.sizeBytes),
+                ms: String(toolStatus.durationMs),
+              })}
+            </div>
+          </div>
+        )}
+        {streaming && toolStatus.kind === 'error' && (
+          <div className="flex justify-start">
+            <div className="inline-flex items-center gap-2 rounded-full px-3 py-1.5 bg-rose-50 border border-rose-200 text-xs text-rose-700">
+              <AlertCircle className="w-3.5 h-3.5" />
+              {t('chat.toolError', { message: toolStatus.message })}
             </div>
           </div>
         )}
@@ -423,6 +550,49 @@ function ChatPanel({ conversation }: { conversation: Conversation }) {
         </form>
       </div>
     </>
+  );
+}
+
+function ArtifactChip({ artifact }: { artifact: Artifact }) {
+  const t = useT();
+  const [downloading, setDownloading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function handleDownload() {
+    setDownloading(true);
+    setError(null);
+    try {
+      await downloadFile(`/chat/artifacts/${artifact.id}/download`, artifact.filename);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'download failed');
+    } finally {
+      setDownloading(false);
+    }
+  }
+
+  return (
+    <div className="inline-flex flex-col gap-1">
+      <button
+        type="button"
+        onClick={handleDownload}
+        disabled={downloading}
+        title={artifact.content_type}
+        className="inline-flex items-center gap-2 px-3 py-2 rounded-xl border border-brand-300 bg-white text-brand-700 hover:bg-brand-50 disabled:opacity-60 text-sm shadow-sm"
+      >
+        {downloading ? (
+          <Loader2 className="w-4 h-4 animate-spin" />
+        ) : (
+          <Download className="w-4 h-4" />
+        )}
+        <span className="font-medium truncate max-w-[20rem]">{artifact.filename}</span>
+        <span className="text-xs text-slate-400">{formatBytes(artifact.size_bytes)}</span>
+      </button>
+      {error && (
+        <span className="text-xs text-rose-600">
+          {t('chat.error')}: {error}
+        </span>
+      )}
+    </div>
   );
 }
 

@@ -5,7 +5,7 @@
 一个自托管的 **[Anthropic Agent Skills](https://docs.claude.com/en/api/agent-sdk/skills)** 管理平台。在一个 Web 应用里完成上传、审核、订阅、下载和在线预览，支持管理员/普通用户角色，数据通过 bind mount 持久化。
 
 ![Status](https://img.shields.io/badge/status-mvp%20complete-green)
-![Tests](https://img.shields.io/badge/tests-43%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-50%20passing-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
 ## 功能一览
@@ -16,6 +16,7 @@
 - 👨‍⚖️ **双轨审核流程** — 管理员上传立即发布；普通用户上传进入审核队列，管理员可通过/驳回（带理由）；驳回后作者可改后重传
 - ⭐ **订阅 + 下载** — 计数自动维护，含每用户历史
 - ▶️ **浏览器内运行** — 含 `scripts/run.js` 的技能可在详情页点 **Run** 由服务端执行，产出的 `.xlsx` / `.docx` / `.pdf` 等文件流回浏览器；服务端预装 `docx` 和 `exceljs`
+- 💬 **对话 + 工具调用** — 在 Chat 里和 LLM（默认 DeepSeek，任意 OpenAI 兼容端点）聊天，并把可运行的技能挂上对话；LLM 会**真的**调用 `run_skill` 工具，产出的文件作为可下载的 artifact 出现在消息气泡里——不再有"我把文件放在 artifacts/"的幻觉
 - 🛠️ **管理后台** — 审核队列、分类与标签 CRUD、用户列表、统计仪表板
 - 🐳 **一键 Docker 部署** — 数据持久化通过 bind mount，重建镜像不丢数据
 
@@ -27,7 +28,7 @@
 | 前端 | React 19 + Vite 8 + TypeScript + TailwindCSS + Zustand + TanStack Query |
 | 认证 | JWT（`@fastify/jwt`）+ bcrypt（rounds=12） |
 | Skill 格式 | [Anthropic Agent Skills](https://docs.claude.com/en/api/agent-sdk/skills)：根 `SKILL.md` + 可选 `scripts/` `references/` `assets/`，打包为 ZIP |
-| 测试 | `node:test`（Node.js 内建），43 个测试覆盖认证、校验、目录、服务端技能执行等 |
+| 测试 | `node:test`（Node.js 内建），50 个测试覆盖认证、校验、目录、服务端技能执行、对话工具调用等 |
 
 ## 快速开始（Docker）
 
@@ -179,6 +180,56 @@ node scripts/build-examples.js
 
 > **安全提醒**：当前不做硬隔离（无 seccomp / cgroups / 网络策略），脚本以服务进程同样的 OS 用户运行。**只对你审核过的技能开放运行**。要让陌生人上传可运行技能，请先接 Firecracker / gVisor / Docker-in-Docker 等外部沙箱。
 
+## Chat 对话与工具调用
+
+Chat Tab 里可以和 LLM 聊天（默认 DeepSeek，通过 `LLM_API_KEY` / `LLM_API_URL` / `LLM_MODEL` 配置任意 OpenAI 兼容端点），并把一个已发布的技能挂到对话上。当被挂载的技能是**可运行的**，LLM 会决定何时调用它，服务端**真的**执行，产出文件作为 **artifact** 落盘并以下载按钮的形式出现在该条消息下。
+
+```
+用户："把这些问题清单导出成 xlsx"
+        ↓
+LLM 流式响应 → tool_call(run_skill, {input:{filename:..., headers:..., rows:...}})
+        ↓
+runner 执行 scripts/run.js   ← 真的 Node 子进程，真的 exceljs
+        ↓
+artifact 落盘到 data/storage/artifacts/{yyyymmdd}/{uuid}.xlsx
+        ↓
+LLM 继续生成 → "已经为你生成了…"
+        ↓
+对话 UI 渲染 assistant 文本 + 一个真实的下载 chip
+```
+
+### 工具是怎么暴露给 LLM 的
+
+- 一个对话最多挂 0 或 1 个 skill（`PATCH /chat/conversations/:id` body 里 `{skill_id}`）
+- 当这个 skill 是可运行的，**只有一个工具** `run_skill` 会暴露给 LLM；其 JSON-Schema 来自 `manifest.run.input_schema`，没声明则用 `{type:"object", additionalProperties:true}`
+- skill 的 `SKILL.md` 内容用作 system prompt，外加一段反幻觉提示，明确告诉模型必须真的调用工具，不能编造文件
+- 目前只暴露 `run_skill`，其他工具（web search、code interpreter 等）暂不在范围
+
+### 循环与限制
+
+- 单条用户消息内最多触发 **3** 次 tool_call
+- 每次 tool_call 沿用 runner 的限制（默认 60s 超时、50 MB 输出、1 MB 输入、进程级单 flight 锁）
+- 失败（`SCRIPT_FAILED`、`TIMEOUT` 等）会作为 tool 结果回喂给 LLM，让它道歉/给建议而不是闷死
+
+### SSE 协议
+
+`POST /api/chat/conversations/:id/messages` 返回 SSE 流：
+
+```
+data: {"content": "…"}                               ← 文本增量
+data: {"tool_call": {"id":"…","name":"run_skill"}}   ← 模型在调工具
+data: {"tool_done": {"filename":"…","content_type":"…","size_bytes":N,"duration_ms":N}}
+data: {"tool_error": {"code":"SCRIPT_FAILED","message":"…"}}
+data: {"message": {"id":N,"content":"…","artifacts":[{...}]}}  ← 已持久化的最终消息
+data: [DONE]
+```
+
+### Artifact 持久化
+
+- 文件落在 `data/storage/artifacts/{yyyymmdd}/{uuid}{ext}`，磁盘文件名是不透明的 UUID；显示用的（中文）原始文件名保存在 DB
+- `Content-Disposition` 用 RFC 5987（`filename*=UTF-8''<percent-encoded>`）保证非 ASCII 文件名能正确下载
+- 删除对话时级联删除 artifact 行，并尽力删除磁盘文件
+
 ## 数据持久化（升级前必读）
 
 所有持久化状态都在宿主机的 `./data/` 目录，bind 挂载到容器的 `/app/data`：
@@ -293,6 +344,14 @@ POST   /admin/skills/:slug/reject      # body: { reason }
 GET    /admin/stats
 GET    /admin/users
 
+GET    /chat/conversations
+POST   /chat/conversations             # body: { skill_id? }
+PATCH  /chat/conversations/:id         # body: { skill_id?, title? }
+DELETE /chat/conversations/:id         # 级联删除消息 + artifacts（DB 与磁盘）
+GET    /chat/conversations/:id/messages
+POST   /chat/conversations/:id/messages  # body: { content }；SSE 流
+GET    /chat/artifacts/:id/download    # 仅 owner
+
 GET    /health                         # { ok, db, ts }
 ```
 
@@ -317,7 +376,7 @@ openskill/
 ├── server/                     # Fastify + better-sqlite3
 │   ├── src/                    # 入口、db、auth、validators、skill-runner、routes/*
 │   ├── sql/                    # 顺序编号的 SQL 迁移
-│   └── test/                   # node:test 测试套件（43 个）
+│   └── test/                   # node:test 测试套件（50 个）
 └── frontend/                   # React + Vite SPA
     └── src/
         ├── components/         # MainLayout、Toast、SkillMarkdown、FileTree

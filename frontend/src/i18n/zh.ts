@@ -211,6 +211,12 @@ export const zh: Record<TranslationKey, string> = {
   'chat.noSkillsFound': '没有匹配的技能',
   'chat.deleteConfirm': '确定删除该对话？',
   'chat.untitled': '新对话',
+  'chat.toolCalling': '正在运行 {name}…',
+  'chat.toolDone': '已生成 {name}（{size}），耗时 {ms} ms',
+  'chat.toolError': '技能运行失败：{message}',
+  'chat.downloadArtifact': '下载',
+  'chat.artifactCount': '附带 {n} 个文件',
+  'chat.runnableHint': '该技能可以产出文件——直接让它生成，对话框会自动调用并附上下载链接。',
 
   // Admin: Review Queue
   'review.title': '审核队列',

@@ -502,11 +502,15 @@ async function skillsRoutes(fastify) {
         'skill run ok',
       );
 
+      const runSafeAscii = result.filename
+        .replace(/"/g, '')
+        .replace(/[^\x20-\x7E]/g, '_');
+      const runUtf8Encoded = encodeURIComponent(result.filename);
       reply
         .header('Content-Type', result.contentType)
         .header(
           'Content-Disposition',
-          `attachment; filename="${result.filename.replace(/"/g, '')}"`,
+          `attachment; filename="${runSafeAscii}"; filename*=UTF-8''${runUtf8Encoded}`,
         )
         .header('Content-Length', String(result.data.length))
         // Surface a couple of useful pieces of metadata for the frontend

@@ -7,7 +7,7 @@ Upload, review, subscribe, download and preview skill packages from one web app 
 with role-based access (admin / user) and durable, bind-mounted data storage.
 
 ![Status](https://img.shields.io/badge/status-mvp%20complete-green)
-![Tests](https://img.shields.io/badge/tests-43%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-50%20passing-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
 ## What you get
@@ -25,6 +25,10 @@ with role-based access (admin / user) and durable, bind-mounted data storage.
 - **Run skill in browser** — for skills containing `scripts/run.js`, click **Run**
   to execute server-side and have the produced file (.xlsx / .docx / .pdf / …)
   streamed back as a download. `docx` and `exceljs` are pre-installed
+- **Chat with skills + tool calling** — talk to an LLM (any OpenAI-compatible
+  endpoint, DeepSeek by default) and it can _actually_ call attached runnable
+  skills via tool calling; the produced files become real downloadable
+  artifacts in the message bubble (no more hallucinated `artifacts/`)
 - **Admin tools**: review queue, categories & tags CRUD, users list, stats dashboard
 - **One-shot Docker deploy** with bind-mounted persistent data
 
@@ -36,7 +40,7 @@ with role-based access (admin / user) and durable, bind-mounted data storage.
 | Frontend | React 19 + Vite 8 + TypeScript + TailwindCSS + Zustand + TanStack Query |
 | Auth | JWT (`@fastify/jwt`) + bcrypt |
 | Skill format | [Anthropic Agent Skills](https://docs.claude.com/en/api/agent-sdk/skills): root `SKILL.md` + optional `scripts/` `references/` `assets/`, packed as ZIP |
-| Tests | `node:test` (built-in), 43 backend tests covering auth, validation, catalog, server-side skill execution, etc. |
+| Tests | `node:test` (built-in), 50 backend tests covering auth, validation, catalog, server-side skill execution, chat tool-calling, etc. |
 
 ## Quick start (Docker)
 
@@ -199,6 +203,76 @@ Then upload the ZIP through the UI and click **Run**.
 > Concurrency: a single-flight, process-wide lock. While one run is in
 > progress, additional `/run` requests return 409 `RUN_BUSY`. Designed for
 > small-team / single-user deployments — see Security model for caveats.
+
+## Chat with skills (LLM tool calling)
+
+The Chat tab lets a user talk to an OpenAI-compatible LLM (DeepSeek by
+default; configurable via `LLM_API_KEY` / `LLM_API_URL` / `LLM_MODEL`) and
+attach a published skill as the conversation's "tool". When the attached
+skill is **runnable**, the LLM can decide to call it, the server **actually
+executes** it, and the resulting file is persisted as an **artifact** that
+the user can download from inside the message bubble.
+
+```
+user: "把这些问题清单导出成 xlsx"
+        ↓
+LLM stream → tool_call(run_skill, {input:{filename:..., headers:..., rows:...}})
+        ↓
+runner executes scripts/run.js   ← real Node subprocess, real exceljs
+        ↓
+artifact saved at data/storage/artifacts/{yyyymmdd}/{uuid}.xlsx
+        ↓
+LLM stream resumed → "已经为你生成了…"
+        ↓
+chat UI renders the assistant text + a download chip linked to the artifact
+```
+
+### How tool exposure works
+
+- A conversation has zero or one attached skill (`PATCH /chat/conversations/:id`
+  with `{skill_id}`).
+- If the attached skill is runnable, exactly one tool — `run_skill` — is
+  exposed to the LLM. Its JSON-schema parameters come from
+  `manifest.run.input_schema` if declared, otherwise `{type:"object", additionalProperties:true}`.
+- The skill's `SKILL.md` content is the system prompt; an extra
+  anti-hallucination block tells the model to call the tool instead of
+  pretending a file exists. (This is the fix for "I've saved the file in
+  artifacts/" hallucinations.)
+- Only the `run_skill` tool is exposed today; other tools (web search, code
+  interpreter, etc.) are out of scope.
+
+### Loop & limits
+
+- Up to **3** tool calls per user message; further calls in the same turn
+  return as if the model finished.
+- Each tool call inherits the existing runner limits (60 s default timeout,
+  50 MB output, 1 MB input, single-flight process-wide lock).
+- Failures (`SCRIPT_FAILED`, `TIMEOUT`, …) are sent back to the model as a
+  tool result so it can apologise / suggest a fix instead of silently dying.
+
+### SSE protocol
+
+`POST /api/chat/conversations/:id/messages` returns an SSE stream. Event
+shapes:
+
+```
+data: {"content": "…"}                               ← text delta
+data: {"tool_call": {"id":"…","name":"run_skill"}}   ← model is calling the tool
+data: {"tool_done": {"filename":"…","content_type":"…","size_bytes":N,"duration_ms":N}}
+data: {"tool_error": {"code":"SCRIPT_FAILED","message":"…"}}
+data: {"message": {"id":N,"content":"…","artifacts":[{...}]}}  ← persisted state
+data: [DONE]
+```
+
+### Artifact persistence
+
+- Files live under `data/storage/artifacts/{yyyymmdd}/{uuid}{ext}` with
+  on-disk names that are intentionally opaque; the original (often Chinese)
+  display name is kept in the DB.
+- `Content-Disposition` uses RFC 5987 (`filename*=UTF-8''<percent-encoded>`)
+  so non-ASCII filenames round-trip correctly.
+- Deleting a conversation cascades the artifact rows and **also removes the
+  files from disk** (best-effort).
 
 ## Architecture
 
@@ -381,6 +455,14 @@ POST   /admin/skills/:slug/reject      # body: { reason }
 GET    /admin/stats
 GET    /admin/users
 
+GET    /chat/conversations
+POST   /chat/conversations             # body: { skill_id? }
+PATCH  /chat/conversations/:id         # body: { skill_id?, title? }
+DELETE /chat/conversations/:id         # cascades messages + artifacts (DB + disk)
+GET    /chat/conversations/:id/messages
+POST   /chat/conversations/:id/messages  # body: { content }; SSE stream
+GET    /chat/artifacts/:id/download    # owner-only
+
 GET    /health                         # { ok, db, ts }
 ```
 
@@ -405,7 +487,7 @@ openskill/
 ├── server/                     # Fastify + better-sqlite3
 │   ├── src/                    # entry, db, auth, validators, skill-runner, routes/*
 │   ├── sql/                    # numbered SQL migrations
-│   └── test/                   # node:test suites (43 tests)
+│   └── test/                   # node:test suites (50 tests)
 └── frontend/                   # React + Vite SPA
     └── src/
         ├── components/         # MainLayout, Toast, SkillMarkdown, FileTree

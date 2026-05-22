@@ -103,6 +103,25 @@ export async function api<T = unknown>(path: string, opts: ApiOptions = {}): Pro
 }
 
 /**
+ * Parse a Content-Disposition header for the filename, preferring the RFC 5987
+ * `filename*=UTF-8''<percent-encoded>` form when present so non-ASCII names
+ * (Chinese, emoji, …) round-trip correctly.
+ */
+function parseFilenameFromContentDisposition(cd: string, fallback: string): string {
+  // RFC 5987 extended form takes precedence
+  const m5987 = cd.match(/filename\*\s*=\s*([^']*)''([^;]+)/i);
+  if (m5987) {
+    try {
+      return decodeURIComponent(m5987[2].trim());
+    } catch {
+      // fall through to ASCII filename
+    }
+  }
+  const m = cd.match(/filename\s*=\s*"?([^";]+)"?/i);
+  return m ? m[1].trim() : fallback;
+}
+
+/**
  * Trigger a file download for a path served by our API. Adds the bearer token
  * via fetch (since `<a download>` cannot inject custom headers) and falls
  * back to throwing ApiClientError on non-2xx so callers can show a toast.
@@ -128,10 +147,9 @@ export async function downloadFile(path: string, suggestedFilename: string): Pro
     throw new ApiClientError(res.status, payload);
   }
 
-  // Honour Content-Disposition filename if present
+  // Honour Content-Disposition filename if present (RFC 5987 first)
   const cd = res.headers.get('content-disposition') || '';
-  const m = cd.match(/filename="?([^"]+)"?/);
-  const filename = m ? m[1] : suggestedFilename;
+  const filename = parseFilenameFromContentDisposition(cd, suggestedFilename);
 
   const blob = await res.blob();
   const objectUrl = URL.createObjectURL(blob);
@@ -186,8 +204,7 @@ export async function postAndDownload(
   }
 
   const cd = res.headers.get('content-disposition') || '';
-  const m = cd.match(/filename="?([^"]+)"?/);
-  const filename = m ? m[1] : fallbackFilename;
+  const filename = parseFilenameFromContentDisposition(cd, fallbackFilename);
   const durationHeader = res.headers.get('x-openskill-run-duration-ms');
   const durationMs = durationHeader ? Number(durationHeader) : null;
 
