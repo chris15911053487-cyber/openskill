@@ -649,3 +649,252 @@ test('agent-mode: model wrongly calls run_skill → UNKNOWN_TOOL', async (t) => 
   assert.strictEqual(toolError.tool_error.code, 'UNKNOWN_TOOL');
   assert.match(toolError.tool_error.message, /run_python_code/);
 });
+
+// ===========================================================================
+// Regression: SKILL.md authored for Claude Code (declares foreign tool
+// names, references absolute Windows paths) must not derail the agent.
+//
+// This is the failure mode we hit in production with the `text-to-issuelist`
+// skill: a 7 KB SKILL.md that says "Tool: run_python_with_write", points at
+// `D:\chris.li\skill\foo.zip`, and writes to `WORKSPACE_DIR/artifacts/`. With
+// the hint appended AFTER that prose, the model gave up on tool-calling and
+// answered with empty promises like "好的，我来整理".
+//
+// Contract verified here:
+//   1. AGENT_TOOL_HINT comes BEFORE the SKILL.md content in the system prompt
+//   2. The hint contains the explicit Claude-Code tool-name translation table
+//   3. The hint forbids the "好的，我来处理" empty-promise pattern
+//   4. The model still emits a real tool_call against this skill, producing
+//      an artifact end-to-end (mocked LLM)
+// ===========================================================================
+
+function buildClaudeCodeStyleSkill() {
+  // SKILL.md that mimics the real-world `text-to-issuelist` failure case.
+  // Importantly: declares Claude-Code-only tool names and Windows paths.
+  const skillMd =
+    `---\n` +
+    `name: claude-style\n` +
+    `description: "Generates an issue-list xlsx. Originally written for Claude Code."\n` +
+    `tools: [run_python, run_python_with_write, open_in_session_tab, fdfind, folder_list, file_read, file_read_docx, file_read_pdf, file_read_pptx, file_type]\n` +
+    `---\n\n` +
+    `# claude-style\n\n` +
+    `## Workflow\n\n` +
+    `### Step 1: locate template\n` +
+    `- **Tool**: \`run_python\`\n` +
+    `- Search for \`D:\\\\chris.li\\\\skill\\\\claude-style.zip\` and unzip it.\n\n` +
+    `### Step 2: write output\n` +
+    `- **Tool**: \`run_python_with_write\`\n` +
+    `- Save the file to \`WORKSPACE_DIR/artifacts/issuelist.xlsx\`.\n\n` +
+    `### Step 3: present\n` +
+    `- **Tool**: \`open_in_session_tab\`\n` +
+    `- Open the file for the user.\n`;
+
+  const zip = new AdmZip();
+  zip.addFile('SKILL.md', Buffer.from(skillMd, 'utf8'));
+  // A template — confirms CWD is set up so the LLM can read it.
+  zip.addFile('templates/note.txt', Buffer.from('claude-style template body', 'utf8'));
+  return zip.toBuffer();
+}
+
+async function uploadClaudeStyleAsAdmin(fastify, token) {
+  const body = multipartBody([
+    { name: 'slug', value: 'claude-style' },
+    {
+      name: 'file',
+      filename: 'claude-style.zip',
+      contentType: 'application/zip',
+      value: buildClaudeCodeStyleSkill(),
+    },
+  ]);
+  const res = await fastify.inject({
+    method: 'POST',
+    url: '/api/skills',
+    headers: { ...multipartHeaders(), authorization: `Bearer ${token}` },
+    payload: body,
+  });
+  assert.strictEqual(res.statusCode, 201, `upload failed: ${res.body}`);
+  return res.json().skill;
+}
+
+test('agent-mode regression: SKILL.md hard-coded for Claude Code — hint sits in front, translation present, model still tool-calls', {
+  skip: !PYTHON_AVAILABLE,
+}, async (t) => {
+  const tmp = freshEnv();
+  const fastify = await bootServer(t, tmp);
+  const token = await loginAs(fastify, 'rootadmin', 'rootpass');
+  const skill = await uploadClaudeStyleAsAdmin(fastify, token);
+
+  // Mocked model emits a real run_python_code tool_call (proves the prompt
+  // didn't mislead it into a different tool name) followed by a wrap-up.
+  // The captured request body lets us assert system-prompt structure.
+  const captured = [];
+  installMockFetch(
+    t,
+    [
+      [
+        dataChunk({
+          choices: [
+            {
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: 'call_regression',
+                    type: 'function',
+                    function: { name: 'run_python_code', arguments: '' },
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+        dataChunk({
+          choices: [
+            {
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    function: {
+                      arguments: JSON.stringify({
+                        code:
+                          "import os\n" +
+                          "with open(os.path.join(os.environ['OPENSKILL_OUTPUT_DIR'], 'out.txt'), 'w', encoding='utf-8') as f:\n" +
+                          "    f.write('regression ok')\n",
+                      }),
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+        dataChunk({ choices: [{ delta: {}, finish_reason: 'tool_calls' }] }),
+        doneChunk(),
+      ],
+      [
+        dataChunk({ choices: [{ delta: { content: 'Done.' } }] }),
+        dataChunk({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+        doneChunk(),
+      ],
+    ],
+    captured,
+  );
+
+  const conv = await fastify.inject({
+    method: 'POST',
+    url: '/api/chat/conversations',
+    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+    payload: JSON.stringify({ skill_id: skill.id }),
+  });
+  const convId = conv.json().id;
+
+  const res = await fastify.inject({
+    method: 'POST',
+    url: `/api/chat/conversations/${convId}/messages`,
+    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+    payload: JSON.stringify({ content: '生成一个 issue list' }),
+  });
+  assert.strictEqual(res.statusCode, 200);
+
+  // ---- 1. System-prompt structure ----
+  const llmReq = captured[0];
+  const sys = llmReq.messages.find((m) => m.role === 'system');
+  assert.ok(sys, 'system message missing');
+
+  // The OpenSkill runtime block must come before the SKILL.md content
+  const runtimeAnchorIdx = sys.content.indexOf('OpenSkill agent runtime');
+  const skillMdAnchorIdx = sys.content.indexOf('Skill domain context');
+  // Pick a string that ONLY exists in the demoted SKILL.md body (not in
+  // the runtime hint translation table). The SKILL.md uses a section
+  // header that we know our hint does not contain.
+  const skillBodyMarkerIdx = sys.content.indexOf('Step 1: locate template');
+  assert.ok(runtimeAnchorIdx >= 0, 'agent runtime block missing from system prompt');
+  assert.ok(skillMdAnchorIdx > runtimeAnchorIdx, 'SKILL.md must follow runtime hint, not precede it');
+  assert.ok(
+    skillBodyMarkerIdx > skillMdAnchorIdx,
+    `expected the demoted SKILL.md body to follow the domain-context header. ` +
+      `runtimeIdx=${runtimeAnchorIdx} skillMdIdx=${skillMdAnchorIdx} bodyIdx=${skillBodyMarkerIdx}`,
+  );
+
+  // ---- 2. Translation table is present ----
+  // We don't lock the exact wording, but a few critical strings must be there.
+  assert.match(sys.content, /run_python_code/);
+  assert.match(sys.content, /OPENSKILL_OUTPUT_DIR/);
+  // Translation entries
+  assert.match(sys.content, /run_python_with_write/);
+  assert.match(sys.content, /open_in_session_tab/);
+  assert.match(sys.content, /WORKSPACE_DIR/);
+  // Anti-prose-promise rule
+  assert.match(sys.content, /好的，我来处理|FORBIDDEN/);
+
+  // ---- 3. Tool exposed to LLM is run_python_code (not run_skill) ----
+  assert.ok(Array.isArray(llmReq.tools));
+  assert.strictEqual(llmReq.tools.length, 1);
+  assert.strictEqual(llmReq.tools[0].function.name, 'run_python_code');
+
+  // ---- 4. Model still actually tool-called and produced an artifact ----
+  const events = parseClientSse(res.body);
+  const toolCallEv = events.find((e) => e.tool_call);
+  assert.ok(toolCallEv, 'expected tool_call SSE event');
+  assert.strictEqual(toolCallEv.tool_call.name, 'run_python_code');
+  const toolDoneEv = events.find((e) => e.tool_done);
+  assert.ok(toolDoneEv, 'expected tool_done SSE event');
+  assert.strictEqual(toolDoneEv.tool_done.filename, 'out.txt');
+
+  const finalEv = events.find((e) => e.message);
+  assert.ok(finalEv);
+  assert.strictEqual(finalEv.message.artifacts.length, 1);
+  assert.strictEqual(finalEv.message.artifacts[0].filename, 'out.txt');
+});
+
+test('agent-mode regression: with no SKILL.md content the hint still appears alone', async (t) => {
+  // Defensive: if a skill somehow has empty SKILL.md content (shouldn't
+  // happen because the validator requires frontmatter, but defensive
+  // belts-and-braces), the runtime hint must still drive the model.
+  const tmp = freshEnv();
+  const fastify = await bootServer(t, tmp);
+  const token = await loginAs(fastify, 'rootadmin', 'rootpass');
+  const skill = await uploadAgentOnlyAsAdmin(fastify, token);
+
+  // Wipe skill_md_content directly in DB for this conversation's skill
+  fastify.db
+    .prepare('UPDATE skills SET skill_md_content = ? WHERE id = ?')
+    .run('', skill.id);
+
+  const captured = [];
+  installMockFetch(
+    t,
+    [
+      [
+        dataChunk({ choices: [{ delta: { content: 'ok' } }] }),
+        dataChunk({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+        doneChunk(),
+      ],
+    ],
+    captured,
+  );
+
+  const conv = await fastify.inject({
+    method: 'POST',
+    url: '/api/chat/conversations',
+    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+    payload: JSON.stringify({ skill_id: skill.id }),
+  });
+  const convId = conv.json().id;
+
+  const res = await fastify.inject({
+    method: 'POST',
+    url: `/api/chat/conversations/${convId}/messages`,
+    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+    payload: JSON.stringify({ content: 'hi' }),
+  });
+  assert.strictEqual(res.statusCode, 200);
+
+  const sys = captured[0].messages.find((m) => m.role === 'system');
+  assert.ok(sys);
+  assert.match(sys.content, /OpenSkill agent runtime/);
+  assert.match(sys.content, /run_python_code/);
+  // No "domain context" header since SKILL.md is empty
+  assert.doesNotMatch(sys.content, /Skill domain context/);
+});

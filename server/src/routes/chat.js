@@ -18,12 +18,19 @@ const MAX_TOOL_ITERATIONS = 3;
 // from hallucinating "I created the file" instead of actually invoking
 // the tool.
 const RUNNABLE_TOOL_HINT = `
-You have access to a tool named "run_skill" that executes the attached skill server-side and produces a downloadable file.
+=== OpenSkill agent runtime — runnable skill ===
+
+You are running inside the OpenSkill server, NOT Claude Code, NOT a local IDE. The ONLY tool available to you is "run_skill". It takes the skill's structured input and executes its entry script server-side; the produced file is automatically attached to your reply as a downloadable artifact.
+
+The SKILL.md content that follows below was written for some other runtime (Claude Code, local file system, etc.) and may reference other tool names or absolute filesystem paths. You must mentally translate / ignore those:
+
+- Any tool name like \`run_python\`, \`run_python_with_write\`, \`bash\`, \`open_in_session_tab\`, \`fdfind\`, \`folder_list\`, \`file_read*\`, \`file_type\` → there is exactly one tool here: **run_skill**. Use it.
+- Any absolute filesystem path (e.g. \`D:\\chris.li\\skill\\...\`, \`/Users/...\`, \`WORKSPACE_DIR/artifacts/\`) → ignore. The skill's bundle is already loaded server-side; you do not need to locate or unzip it.
 
 RULES:
-1. When the user asks for a deliverable (a Word/Excel/PDF/etc. file, a generated artifact), you MUST call run_skill instead of describing the file in prose.
+1. When the user asks for a deliverable (a Word/Excel/PDF/etc. file), you MUST call run_skill with the appropriate JSON input. Do NOT describe the file in prose without calling the tool first.
 2. Never claim a file has been created if you have not received a successful tool result for that file in this turn. Pretending an "artifacts/" directory exists or that you have "saved" a file without calling the tool is forbidden.
-3. After run_skill returns successfully, write a short reply telling the user the file is ready. The user's UI will render a download button automatically — do NOT invent download links.
+3. After run_skill returns successfully, write a short reply telling the user the file is ready. The OpenSkill UI will render a download button automatically — do NOT invent download links.
 4. If the tool returns ok=false, briefly explain the failure and suggest a fix; do not retry blindly.
 `.trim();
 
@@ -32,16 +39,36 @@ RULES:
 // declarative skills (xlsx, text-to-issuelist, ...). The LLM writes Python
 // 3 against the bundled templates / assets at runtime.
 const AGENT_TOOL_HINT = `
-You are running INSIDE an OpenSkill agent runtime. The tool \`run_python_code\` lets you execute arbitrary Python 3 against this skill's bundle. The bundle's \`scripts/\` directory is at your CWD; templates / assets the skill ships are in their original relative paths.
+=== OpenSkill agent runtime — Python execution ===
 
-Pre-installed libraries: openpyxl, pandas, python-docx, pdfplumber, Pillow, lxml. LibreOffice (\`soffice\` / \`libreoffice\`) is on PATH for formula recalc / format conversion.
+You are running inside the OpenSkill server, NOT Claude Code, NOT a local IDE. The ONLY tool available to you is **run_python_code**, which takes \`{ code: string, stdin?: string }\` and executes Python 3 server-side against this skill's already-unzipped bundle.
+
+Environment when your code runs:
+- CWD = the root of the unzipped skill bundle. Templates, assets, scripts/ etc. are at their original relative paths inside the bundle (e.g. \`模板/foo.xlsx\`, \`scripts/recalc.py\`).
+- \`os.environ['OPENSKILL_OUTPUT_DIR']\` = the directory you MUST write output files into. Anything written there becomes a downloadable artifact in your reply.
+- Pre-installed libraries on PYTHONPATH: openpyxl, pandas, python-docx, pdfplumber, Pillow, lxml.
+- LibreOffice (\`soffice\` / \`libreoffice\`) is on PATH for spreadsheet formula recalc / PDF conversion.
+
+The SKILL.md content that follows below was authored for the original Anthropic Claude Code / Agent SDK runtime and references tool names and filesystem paths that DO NOT EXIST here. Translate them as you read:
+
+| What SKILL.md says                                              | What you should actually do here                          |
+|-----------------------------------------------------------------|-----------------------------------------------------------|
+| Tool: \`run_python\`                                             | Call \`run_python_code\` with that python in \`code\`.       |
+| Tool: \`run_python_with_write\`                                  | Same — \`run_python_code\` already has full write access.    |
+| Tools: \`bash\`, \`fdfind\`, \`folder_list\`, \`file_type\`            | Do the equivalent in Python (\`subprocess\`, \`pathlib\`, \`os\`). |
+| Tools: \`file_read\`, \`file_read_docx\`, \`file_read_pdf\`, \`file_read_pptx\` | Read the file directly in Python (python-docx, pdfplumber, openpyxl, etc.). |
+| Tool: \`open_in_session_tab\`                                    | Just save the file to \`OPENSKILL_OUTPUT_DIR\` — the UI handles the rest. |
+| Path: \`D:\\chris.li\\skill\\foo.zip\` (or any absolute Windows / *nix path) | Ignore. The skill is already unzipped at your CWD.        |
+| Path: \`WORKSPACE_DIR/artifacts/...\`                             | Use \`os.environ['OPENSKILL_OUTPUT_DIR']\` instead.          |
+| Path: \`attached_files/...\`                                     | Not present here. Ask the user if you really need an upload. |
+| Skill self-extracts a zip from disk                             | Skip — the skill's files are already at CWD.              |
 
 RULES:
-1. When the user asks for a deliverable, you MUST call run_python_code instead of describing the result in prose. Do NOT pretend a file was generated unless the tool returned a successful result for it in this turn.
-2. Write output files to \`os.environ['OPENSKILL_OUTPUT_DIR']\`. The runtime will attach them to your reply automatically — do NOT invent download URLs.
-3. The skill's CWD is the unzipped skill bundle. Read templates with relative paths (e.g. \`openpyxl.load_workbook('模板/foo.xlsx')\`).
-4. After run_python_code returns, briefly tell the user the file is ready.
-5. If the tool returns ok=false, briefly explain the failure; don't blindly retry.
+1. When the user asks for a deliverable, you MUST call \`run_python_code\` with real Python that produces the file. Do NOT just promise to do it in prose. "好的，我来处理" / "let me start working on it" with no tool call is FORBIDDEN.
+2. Write output files to \`os.environ['OPENSKILL_OUTPUT_DIR']\`. Do NOT invent download URLs or claim a file was saved unless the tool returned ok=true for it in this turn.
+3. After \`run_python_code\` returns successfully, send a short reply telling the user the file is ready (the UI will render the download chip automatically).
+4. If the tool returns ok=false, briefly explain the failure based on stderr and try a corrected version once. Do not retry blindly more than once.
+5. If you genuinely need information from the user before you can run code (e.g. company name to fill into a template), ask ONCE concisely; once they answer, immediately call the tool.
 `.trim();
 
 /**
@@ -366,9 +393,27 @@ async function chatRoutes(app) {
         manifest,
         fileTree,
       );
-      let systemPrompt = DEFAULT_SYSTEM_PROMPT;
-      if (skillRow?.skill_md_content) systemPrompt = skillRow.skill_md_content;
-      if (toolHint) systemPrompt += '\n\n---\n\n' + toolHint;
+
+      // Build the system prompt with the runtime hint FIRST so it has primacy
+      // over a long SKILL.md that may have been authored for Claude Code /
+      // local IDE and references unrelated tool names + absolute filesystem
+      // paths. The SKILL.md follows under a clearly-labelled "domain context"
+      // header so the model treats it as task-domain knowledge, not as
+      // authoritative runtime instructions.
+      let systemPrompt;
+      if (toolHint) {
+        let body = toolHint;
+        if (skillRow?.skill_md_content) {
+          body +=
+            '\n\n=== Skill domain context (SKILL.md, authored for a different runtime — read for task knowledge, ignore tool names + absolute paths) ===\n\n' +
+            skillRow.skill_md_content;
+        }
+        systemPrompt = body;
+      } else if (skillRow?.skill_md_content) {
+        systemPrompt = skillRow.skill_md_content;
+      } else {
+        systemPrompt = DEFAULT_SYSTEM_PROMPT;
+      }
 
       // Build the OpenAI-shape history. We pass {role, content} pairs from
       // the DB; tool exchanges are appended in-memory inside the loop and
