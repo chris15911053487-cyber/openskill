@@ -48,9 +48,17 @@ test('migrations apply once and create all expected tables', async (t) => {
   assert.ok(tables.includes('audit_logs'));
   assert.ok(tables.includes('migrations'));
 
-  const migRows = fastify.db.prepare('SELECT name FROM migrations').all();
-  assert.strictEqual(migRows.length, 1);
-  assert.strictEqual(migRows[0].name, '001_init.sql');
+  const migRows = fastify.db.prepare('SELECT name FROM migrations ORDER BY name').all();
+  // Expect every NNN_*.sql file under sql/ to have been applied
+  const sqlFiles = fs
+    .readdirSync(path.resolve(__dirname, '..', 'sql'))
+    .filter((n) => /^\d+_.*\.sql$/.test(n))
+    .sort();
+  assert.strictEqual(migRows.length, sqlFiles.length);
+  assert.deepStrictEqual(
+    migRows.map((r) => r.name),
+    sqlFiles,
+  );
 });
 
 test('admin seed is idempotent and respects env vars', async (t) => {
@@ -89,7 +97,10 @@ test('admin seed is idempotent and respects env vars', async (t) => {
 
   // And no migration was re-applied
   const migRows = fastify2.db.prepare('SELECT name FROM migrations').all();
-  assert.strictEqual(migRows.length, 1);
+  const sqlFiles = fs
+    .readdirSync(path.resolve(__dirname, '..', 'sql'))
+    .filter((n) => /^\d+_.*\.sql$/.test(n));
+  assert.strictEqual(migRows.length, sqlFiles.length);
 });
 
 test('admin seed throws when no admin exists and no password set', async (t) => {

@@ -36,7 +36,7 @@ async function bootServer(t, tmp) {
 async function loginAs(fastify, username, password) {
   const r = await fastify.inject({
     method: 'POST',
-    url: '/auth/login',
+    url: '/api/auth/login',
     payload: { username, password },
   });
   assert.strictEqual(r.statusCode, 200);
@@ -46,7 +46,7 @@ async function loginAs(fastify, username, password) {
 async function registerUser(fastify, username) {
   const r = await fastify.inject({
     method: 'POST',
-    url: '/auth/register',
+    url: '/api/auth/register',
     payload: { username, email: `${username}@test.com`, password: 'pa$$w0rd1' },
   });
   assert.strictEqual(r.statusCode, 201);
@@ -143,7 +143,7 @@ test('upload: happy path as admin → status=published', async (t) => {
 
   const res = await fastify.inject({
     method: 'POST',
-    url: '/skills',
+    url: '/api/skills',
     headers: { ...multipartHeaders(), authorization: `Bearer ${adminTok}` },
     payload: multipartBody([
       { name: 'file', filename: 'pdf-helper.zip', contentType: 'application/zip', value: zip },
@@ -180,7 +180,7 @@ test('upload: as regular user → status=pending', async (t) => {
   const zip = buildSkillZip();
   const res = await fastify.inject({
     method: 'POST',
-    url: '/skills',
+    url: '/api/skills',
     headers: { ...multipartHeaders(), authorization: `Bearer ${userTok}` },
     payload: multipartBody([
       { name: 'file', filename: 's.zip', contentType: 'application/zip', value: zip },
@@ -197,7 +197,7 @@ test('upload: requires auth', async (t) => {
   const zip = buildSkillZip();
   const res = await fastify.inject({
     method: 'POST',
-    url: '/skills',
+    url: '/api/skills',
     headers: multipartHeaders(),
     payload: multipartBody([
       { name: 'file', filename: 's.zip', contentType: 'application/zip', value: zip },
@@ -216,7 +216,7 @@ test('upload: missing SKILL.md → MISSING_SKILL_MD', async (t) => {
   });
   const res = await fastify.inject({
     method: 'POST',
-    url: '/skills',
+    url: '/api/skills',
     headers: { ...multipartHeaders(), authorization: `Bearer ${tok}` },
     payload: multipartBody([
       { name: 'file', filename: 'bad.zip', contentType: 'application/zip', value: zip },
@@ -235,7 +235,7 @@ test('upload: missing name in frontmatter → MISSING_NAME', async (t) => {
   });
   const res = await fastify.inject({
     method: 'POST',
-    url: '/skills',
+    url: '/api/skills',
     headers: { ...multipartHeaders(), authorization: `Bearer ${tok}` },
     payload: multipartBody([
       { name: 'file', filename: 'bad.zip', contentType: 'application/zip', value: zip },
@@ -254,7 +254,7 @@ test('upload: missing description → MISSING_DESCRIPTION', async (t) => {
   });
   const res = await fastify.inject({
     method: 'POST',
-    url: '/skills',
+    url: '/api/skills',
     headers: { ...multipartHeaders(), authorization: `Bearer ${tok}` },
     payload: multipartBody([
       { name: 'file', filename: 'bad.zip', contentType: 'application/zip', value: zip },
@@ -270,7 +270,7 @@ test('upload: corrupt ZIP → ZIP_CORRUPT', async (t) => {
   const tok = await loginAs(fastify, 'rootadmin', 'rootpass');
   const res = await fastify.inject({
     method: 'POST',
-    url: '/skills',
+    url: '/api/skills',
     headers: { ...multipartHeaders(), authorization: `Bearer ${tok}` },
     payload: multipartBody([
       {
@@ -294,7 +294,7 @@ test('upload: invalid frontmatter YAML → INVALID_FRONTMATTER', async (t) => {
   });
   const res = await fastify.inject({
     method: 'POST',
-    url: '/skills',
+    url: '/api/skills',
     headers: { ...multipartHeaders(), authorization: `Bearer ${tok}` },
     payload: multipartBody([
       { name: 'file', filename: 's.zip', contentType: 'application/zip', value: zip },
@@ -311,7 +311,7 @@ test('upload: wrapper directory is unwrapped transparently', async (t) => {
   const zip = buildSkillZip({ withWrapper: true });
   const res = await fastify.inject({
     method: 'POST',
-    url: '/skills',
+    url: '/api/skills',
     headers: { ...multipartHeaders(), authorization: `Bearer ${tok}` },
     payload: multipartBody([
       { name: 'file', filename: 's.zip', contentType: 'application/zip', value: zip },
@@ -334,7 +334,7 @@ test('upload: duplicate slug → SKILL_EXISTS', async (t) => {
   const zip = buildSkillZip();
   const r1 = await fastify.inject({
     method: 'POST',
-    url: '/skills',
+    url: '/api/skills',
     headers: { ...multipartHeaders(), authorization: `Bearer ${tok}` },
     payload: multipartBody([
       { name: 'file', filename: 's.zip', contentType: 'application/zip', value: zip },
@@ -344,7 +344,7 @@ test('upload: duplicate slug → SKILL_EXISTS', async (t) => {
 
   const r2 = await fastify.inject({
     method: 'POST',
-    url: '/skills',
+    url: '/api/skills',
     headers: { ...multipartHeaders(), authorization: `Bearer ${tok}` },
     payload: multipartBody([
       { name: 'file', filename: 's.zip', contentType: 'application/zip', value: zip },
@@ -362,19 +362,19 @@ test('upload: with category and tags', async (t) => {
   // Create category and tags
   await fastify.inject({
     method: 'POST',
-    url: '/admin/categories',
+    url: '/api/admin/categories',
     headers: { authorization: `Bearer ${tok}` },
     payload: { name: 'Productivity' },
   });
   await fastify.inject({
     method: 'POST',
-    url: '/admin/tags',
+    url: '/api/admin/tags',
     headers: { authorization: `Bearer ${tok}` },
     payload: { name: 'writing' },
   });
   await fastify.inject({
     method: 'POST',
-    url: '/admin/tags',
+    url: '/api/admin/tags',
     headers: { authorization: `Bearer ${tok}` },
     payload: { name: 'pdf' },
   });
@@ -382,7 +382,7 @@ test('upload: with category and tags', async (t) => {
   const zip = buildSkillZip();
   const res = await fastify.inject({
     method: 'POST',
-    url: '/skills',
+    url: '/api/skills',
     headers: { ...multipartHeaders(), authorization: `Bearer ${tok}` },
     payload: multipartBody([
       { name: 'categorySlug', value: 'productivity' },
@@ -415,7 +415,7 @@ test('upload: unknown category → CATEGORY_NOT_FOUND', async (t) => {
   const zip = buildSkillZip();
   const res = await fastify.inject({
     method: 'POST',
-    url: '/skills',
+    url: '/api/skills',
     headers: { ...multipartHeaders(), authorization: `Bearer ${tok}` },
     payload: multipartBody([
       { name: 'categorySlug', value: 'nonexistent' },
@@ -435,7 +435,7 @@ test('upload: with manifest.json captures version', async (t) => {
   });
   const res = await fastify.inject({
     method: 'POST',
-    url: '/skills',
+    url: '/api/skills',
     headers: { ...multipartHeaders(), authorization: `Bearer ${tok}` },
     payload: multipartBody([
       { name: 'file', filename: 's.zip', contentType: 'application/zip', value: zip },

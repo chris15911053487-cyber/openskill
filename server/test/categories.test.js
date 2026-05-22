@@ -34,7 +34,7 @@ async function bootServer(t, tmp) {
 async function loginAs(fastify, username, password) {
   const r = await fastify.inject({
     method: 'POST',
-    url: '/auth/login',
+    url: '/api/auth/login',
     payload: { username, password },
   });
   assert.strictEqual(r.statusCode, 200, `login failed: ${r.body}`);
@@ -44,7 +44,7 @@ async function loginAs(fastify, username, password) {
 async function registerUser(fastify, username, password = 'pa$$w0rd1') {
   const r = await fastify.inject({
     method: 'POST',
-    url: '/auth/register',
+    url: '/api/auth/register',
     payload: { username, email: `${username}@test.com`, password },
   });
   assert.strictEqual(r.statusCode, 201);
@@ -65,7 +65,7 @@ test('categories: list is public, create/patch/delete admin only', async (t) => 
   const fastify = await bootServer(t, tmp);
 
   // public list works without auth
-  const list1 = await fastify.inject({ method: 'GET', url: '/categories' });
+  const list1 = await fastify.inject({ method: 'GET', url: '/api/categories' });
   assert.strictEqual(list1.statusCode, 200);
   assert.deepStrictEqual(list1.json().categories, []);
 
@@ -73,7 +73,7 @@ test('categories: list is public, create/patch/delete admin only', async (t) => 
   const userTok = await registerUser(fastify, 'alice');
   const userCreate = await fastify.inject({
     method: 'POST',
-    url: '/admin/categories',
+    url: '/api/admin/categories',
     headers: { authorization: `Bearer ${userTok}` },
     payload: { name: 'Productivity' },
   });
@@ -84,7 +84,7 @@ test('categories: list is public, create/patch/delete admin only', async (t) => 
   const adminTok = await loginAs(fastify, 'rootadmin', 'rootpass');
   const create = await fastify.inject({
     method: 'POST',
-    url: '/admin/categories',
+    url: '/api/admin/categories',
     headers: { authorization: `Bearer ${adminTok}` },
     payload: { name: 'Productivity & Tools' },
   });
@@ -96,7 +96,7 @@ test('categories: list is public, create/patch/delete admin only', async (t) => 
   // duplicate
   const dup = await fastify.inject({
     method: 'POST',
-    url: '/admin/categories',
+    url: '/api/admin/categories',
     headers: { authorization: `Bearer ${adminTok}` },
     payload: { name: 'Productivity & Tools' },
   });
@@ -106,7 +106,7 @@ test('categories: list is public, create/patch/delete admin only', async (t) => 
   // patch
   const patch = await fastify.inject({
     method: 'PATCH',
-    url: '/admin/categories/productivity-tools',
+    url: '/api/admin/categories/productivity-tools',
     headers: { authorization: `Bearer ${adminTok}` },
     payload: { description: 'Tools that boost productivity' },
   });
@@ -116,12 +116,12 @@ test('categories: list is public, create/patch/delete admin only', async (t) => 
   // delete
   const del = await fastify.inject({
     method: 'DELETE',
-    url: '/admin/categories/productivity-tools',
+    url: '/api/admin/categories/productivity-tools',
     headers: { authorization: `Bearer ${adminTok}` },
   });
   assert.strictEqual(del.statusCode, 204);
 
-  const list2 = await fastify.inject({ method: 'GET', url: '/categories' });
+  const list2 = await fastify.inject({ method: 'GET', url: '/api/categories' });
   assert.deepStrictEqual(list2.json().categories, []);
 });
 
@@ -133,7 +133,7 @@ test('tags: full CRUD with admin permissions', async (t) => {
 
   const create = await fastify.inject({
     method: 'POST',
-    url: '/admin/tags',
+    url: '/api/admin/tags',
     headers: { authorization: `Bearer ${adminTok}` },
     payload: { name: 'Writing' },
   });
@@ -143,14 +143,14 @@ test('tags: full CRUD with admin permissions', async (t) => {
   // explicit slug overrides derived
   const create2 = await fastify.inject({
     method: 'POST',
-    url: '/admin/tags',
+    url: '/api/admin/tags',
     headers: { authorization: `Bearer ${adminTok}` },
     payload: { name: 'Code Review', slug: 'code-rev' },
   });
   assert.strictEqual(create2.statusCode, 201);
   assert.strictEqual(create2.json().tag.slug, 'code-rev');
 
-  const list = await fastify.inject({ method: 'GET', url: '/tags' });
+  const list = await fastify.inject({ method: 'GET', url: '/api/tags' });
   assert.strictEqual(list.statusCode, 200);
   const tags = list.json().tags;
   assert.strictEqual(tags.length, 2);
@@ -160,14 +160,14 @@ test('tags: full CRUD with admin permissions', async (t) => {
   const userTok = await registerUser(fastify, 'bob');
   const userDel = await fastify.inject({
     method: 'DELETE',
-    url: '/admin/tags/writing',
+    url: '/api/admin/tags/writing',
     headers: { authorization: `Bearer ${userTok}` },
   });
   assert.strictEqual(userDel.statusCode, 403);
 
   const adminDel = await fastify.inject({
     method: 'DELETE',
-    url: '/admin/tags/writing',
+    url: '/api/admin/tags/writing',
     headers: { authorization: `Bearer ${adminTok}` },
   });
   assert.strictEqual(adminDel.statusCode, 204);
@@ -180,7 +180,7 @@ test('category: invalid slug from name throws INVALID_SLUG', async (t) => {
 
   const r = await fastify.inject({
     method: 'POST',
-    url: '/admin/categories',
+    url: '/api/admin/categories',
     headers: { authorization: `Bearer ${adminTok}` },
     payload: { name: '中文分类' },
   });

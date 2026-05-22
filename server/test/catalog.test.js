@@ -74,7 +74,7 @@ async function bootServer(t, tmp) {
 async function loginAdmin(fastify) {
   const r = await fastify.inject({
     method: 'POST',
-    url: '/auth/login',
+    url: '/api/auth/login',
     payload: { username: 'rootadmin', password: 'rootpass' },
   });
   return r.json().token;
@@ -84,7 +84,7 @@ async function uploadSkill(fastify, tok, name, opts = {}) {
   const zip = buildZip(name, opts.description || 'desc');
   return fastify.inject({
     method: 'POST',
-    url: '/skills',
+    url: '/api/skills',
     headers: { ...multipartHeaders(), authorization: `Bearer ${tok}` },
     payload: multipartBody([
       ...(opts.categorySlug ? [{ name: 'categorySlug', value: opts.categorySlug }] : []),
@@ -109,12 +109,12 @@ test('GET /skills — public list, filters, sort, pagination', async (t) => {
   // Pending skill from regular user should NOT appear in public list
   const userR = await fastify.inject({
     method: 'POST',
-    url: '/auth/register',
+    url: '/api/auth/register',
     payload: { username: 'joe', email: 'joe@x.com', password: 'pa$$w0rd1' },
   });
   await uploadSkill(fastify, userR.json().token, 'pending-one');
 
-  const list = await fastify.inject({ method: 'GET', url: '/skills' });
+  const list = await fastify.inject({ method: 'GET', url: '/api/skills' });
   assert.strictEqual(list.statusCode, 200);
   const body = list.json();
   assert.strictEqual(body.total, 3);
@@ -122,19 +122,19 @@ test('GET /skills — public list, filters, sort, pagination', async (t) => {
   assert.ok(body.items.every((s) => s.status === 'published'));
 
   // Search
-  const q = await fastify.inject({ method: 'GET', url: '/skills?q=csv' });
+  const q = await fastify.inject({ method: 'GET', url: '/api/skills?q=csv' });
   assert.strictEqual(q.json().total, 1);
   assert.strictEqual(q.json().items[0].slug, 'charlie');
 
   // Pagination
-  const p1 = await fastify.inject({ method: 'GET', url: '/skills?limit=2&page=1&sort=name' });
+  const p1 = await fastify.inject({ method: 'GET', url: '/api/skills?limit=2&page=1&sort=name' });
   assert.strictEqual(p1.json().items.length, 2);
   assert.strictEqual(p1.json().pages, 2);
 
   // Admin can list pending via status= param
   const adminPending = await fastify.inject({
     method: 'GET',
-    url: '/skills?status=pending',
+    url: '/api/skills?status=pending',
     headers: { authorization: `Bearer ${tok}` },
   });
   assert.strictEqual(adminPending.json().total, 1);
@@ -147,7 +147,7 @@ test('GET /skills/:slug — detail, hides pending from non-author', async (t) =>
   const adminTok = await loginAdmin(fastify);
   const userR = await fastify.inject({
     method: 'POST',
-    url: '/auth/register',
+    url: '/api/auth/register',
     payload: { username: 'alice', email: 'alice@x.com', password: 'pa$$w0rd1' },
   });
   const userTok = userR.json().token;
@@ -156,18 +156,18 @@ test('GET /skills/:slug — detail, hides pending from non-author', async (t) =>
   await uploadSkill(fastify, userTok, 'private-one'); // pending
 
   // Public can fetch published
-  const r1 = await fastify.inject({ method: 'GET', url: '/skills/public-one' });
+  const r1 = await fastify.inject({ method: 'GET', url: '/api/skills/public-one' });
   assert.strictEqual(r1.statusCode, 200);
   assert.strictEqual(r1.json().skill.status, 'published');
 
   // Anonymous cannot see pending
-  const r2 = await fastify.inject({ method: 'GET', url: '/skills/private-one' });
+  const r2 = await fastify.inject({ method: 'GET', url: '/api/skills/private-one' });
   assert.strictEqual(r2.statusCode, 404);
 
   // Author can see own pending
   const r3 = await fastify.inject({
     method: 'GET',
-    url: '/skills/private-one',
+    url: '/api/skills/private-one',
     headers: { authorization: `Bearer ${userTok}` },
   });
   assert.strictEqual(r3.statusCode, 200);
@@ -176,7 +176,7 @@ test('GET /skills/:slug — detail, hides pending from non-author', async (t) =>
   // Admin can see any pending
   const r4 = await fastify.inject({
     method: 'GET',
-    url: '/skills/private-one',
+    url: '/api/skills/private-one',
     headers: { authorization: `Bearer ${adminTok}` },
   });
   assert.strictEqual(r4.statusCode, 200);
@@ -184,12 +184,12 @@ test('GET /skills/:slug — detail, hides pending from non-author', async (t) =>
   // Other user cannot
   const otherR = await fastify.inject({
     method: 'POST',
-    url: '/auth/register',
+    url: '/api/auth/register',
     payload: { username: 'bob', email: 'bob@x.com', password: 'pa$$w0rd1' },
   });
   const r5 = await fastify.inject({
     method: 'GET',
-    url: '/skills/private-one',
+    url: '/api/skills/private-one',
     headers: { authorization: `Bearer ${otherR.json().token}` },
   });
   assert.strictEqual(r5.statusCode, 404);
